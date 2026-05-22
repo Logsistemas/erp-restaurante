@@ -1007,7 +1007,7 @@ def menus_por_perfil():
         "Importar Nota",
         "Importar Cupom Foto",
         "Entrada Manual",
-        "Saída PEPS",
+        "Lançar Saída",
         "Estoque Atual",
         "Lotes",
         "Movimentações",
@@ -1036,7 +1036,7 @@ def menus_por_perfil():
         "Importar Nota",
         "Importar Cupom Foto",
         "Entrada Manual",
-        "Saída PEPS",
+        "Lançar Saída",
         "Estoque Atual",
         "Lotes",
         "Movimentações"
