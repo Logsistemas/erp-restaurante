@@ -2070,7 +2070,7 @@ elif menu == "Entrada Manual":
 # =========================================================
 # SAÍDA / VENDA / PERDA
 # =========================================================
-elif menu == "Saída PEPS":
+elif menu == "Lançar Saída":
     st.subheader("Saída / Venda / Perda — PEPS")
     st.caption("Venda gera receita. Perda, consumo interno, produção e ajuste baixam estoque e entram no CMV operacional, mas sem receita.")
 
