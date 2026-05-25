@@ -14,6 +14,120 @@ DB_PATH = Path("estoque_restaurante.db")
 META_CMV = 36.0
 
 st.set_page_config(page_title="Estoque Restaurante | PEPS + CMV", layout="wide")
+st.markdown("""
+<style>
+
+/* FUNDO GERAL */
+.stApp {
+    background-color: #f5f7fb;
+}
+
+.main .block-container {
+    background: #f5f7fb;
+    padding: 2rem 2.5rem;
+}
+
+section.main > div {
+    background: #f5f7fb;
+}
+
+div[data-testid="column"] {
+    background: transparent;
+}
+
+div[data-testid="stHorizontalBlock"] {
+    gap: 18px;
+}
+
+div[data-testid="stMetric"] {
+    background: #ffffff !important;
+    border-radius: 22px !important;
+    padding: 28px 24px !important;
+    min-height: 130px !important;
+    border: 1px solid #dbe3ef !important;
+    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.10) !important;
+}
+
+[data-testid="stMetricValue"] {
+    font-size: 36px !important;
+    font-weight: 900 !important;
+}
+
+[data-testid="stMetricLabel"] {
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    color: #64748b !important;
+}
+
+/* REMOVE ESPAÇOS */
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 2rem;
+}
+
+/* CARDS */
+div[data-testid="stMetric"] {
+    background: white;
+    padding: 26px 22px;
+    border-radius: 24px;
+    border: 1px solid #e5e7eb;
+    box-shadow:
+        0 1px 2px rgba(0,0,0,0.04),
+        0 8px 24px rgba(15,23,42,0.06);
+    transition: all 0.2s ease;
+    min-height: 135px;
+}
+
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-4px);
+    box-shadow:
+        0 12px 30px rgba(15,23,42,0.10);
+}
+
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 28px rgba(15,23,42,0.10);
+}
+
+/* TABELAS */
+div[data-testid="stDataFrame"] {
+    background: white;
+    border-radius: 18px;
+    padding: 10px;
+    border: 1px solid #ececec;
+    overflow: hidden;
+}
+
+/* MENU HORIZONTAL */
+.stRadio > div {
+    background: white;
+    padding: 12px;
+    border-radius: 16px;
+    border: 1px solid #ececec;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.04);
+}
+
+/* BOTÕES */
+.stButton > button {
+    border-radius: 12px;
+    border: none;
+    background: linear-gradient(135deg, #111827, #1f2937);
+    color: white;
+    font-weight: 600;
+}
+
+/* TITULOS */
+h1, h2, h3 {
+    color: #111827;
+}
+
+/* SIDEBAR */
+[data-testid="stSidebar"] {
+    background-color: #ffffff;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 
 # =========================================================
@@ -1355,13 +1469,43 @@ init_db()
 seed()
 garantir_usuarios_json()
 exigir_login()
+user = st.session_state.get("usuario_logado", {})
 
-st.title("📦 Sistema de Estoque Restaurante — PEPS + CMV")
-st.caption("Controle permitido: PEPS + CMV mensal. Meta ideal configurada: 36%.")
+st.markdown("""
+<div style="
+    background: linear-gradient(135deg, #111827 0%, #1e3a8a 55%, #2563eb 100%);
+    padding: 28px 32px;
+    border-radius: 24px;
+    color: white;
+    margin-bottom: 24px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+">
+    <div style="font-size: 14px; opacity: 0.8;">ERP Inteligente para Restaurantes</div>
+    <div style="font-size: 34px; font-weight: 800; margin-top: 6px;">
+        📦 Estoque, CMV e Gestão Operacional
+    </div>
+    <div style="font-size: 15px; opacity: 0.85; margin-top: 8px;">
+        Controle PEPS • CMV em tempo real • Alertas inteligentes • Apoio à decisão
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 menus_permitidos = menus_por_perfil()
-menu = st.sidebar.radio("Menu", menus_permitidos)
-logout_sidebar()
+menu = st.radio(
+    "Navegação",
+    menus_permitidos,
+    horizontal=True
+)
+# logout_sidebar()
+
+col_user, col_sair = st.columns([8, 1])
+
+with col_user:
+    st.caption(f"👤 {user.get('nome', user.get('usuario'))} | Perfil: {user.get('tipo', '-')}")
+with col_sair:
+    if st.button("Sair"):
+        st.session_state.pop("usuario_logado", None)
+        st.rerun()
 
 pdf = produtos_df()
 
@@ -1373,7 +1517,19 @@ if menu == "Painel CMV":
     st.markdown("""
         <style>
             .block-container {padding-top: 1.4rem;}
-            [data-testid="stMetricValue"] {font-size: 26px;}
+            [data-testid="stMetricValue"] {
+    font-size: 34px;
+    font-weight: 800;
+    color: #111827;
+    letter-spacing: -1px;
+}
+
+[data-testid="stMetricLabel"] {
+    font-size: 13px;
+    color: #64748b;
+    font-weight: 600;
+    text-transform: uppercase;
+}
             div[data-testid="stDataFrame"] {border-radius: 14px; overflow: hidden;}
         </style>
     """, unsafe_allow_html=True)
@@ -1587,7 +1743,13 @@ if menu == "Painel CMV":
 elif menu == "📱 Executivo Mobile":
     st.markdown("""
         <style>
-            .block-container {padding-top: 0.7rem; padding-left: 0.85rem; padding-right: 0.85rem; max-width: 980px;}
+            .block-container {
+    padding-top: 0.8rem;
+    padding-bottom: 1rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+    max-width: 100%;
+}
             [data-testid="stSidebar"] {min-width: 250px;}
             .exec-hero {
                 background: linear-gradient(135deg, #0f172a 0%, #1e293b 52%, #334155 100%);
