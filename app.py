@@ -8,6 +8,7 @@ import streamlit as st
 from PIL import Image
 import re
 import json
+import requests
 
 DB_PATH = Path("estoque_restaurante.db")
 META_CMV = 36.0
@@ -676,6 +677,295 @@ def periodo_label(inicio, fim):
     fim_visivel = (pd.Timestamp(fim) - pd.Timedelta(days=1)).date()
     return f"{pd.Timestamp(inicio).date().strftime('%d/%m/%Y')} até {fim_visivel.strftime('%d/%m/%Y')}"
 
+
+
+
+# =========================================================
+# MOTOR DE ALERTAS INTELIGENTES ERP
+# =========================================================
+def gerar_alertas_inteligentes_erp(inicio=None, fim=None):
+    """Gera alertas executivos, ações recomendadas e mensagem pronta para WhatsApp."""
+    if inicio is None or fim is None:
+        inicio, fim = datas_periodo("Este mês")
+
+    nome_empresa = get_config("nome_empresa", "Restaurante")
+    meta_cmv = get_float_config("meta_cmv_ideal", META_CMV)
+    alerta_cmv = get_float_config("meta_cmv_alerta", meta_cmv + 4)
+    critica_cmv = get_float_config("meta_cmv_critica", meta_cmv + 8)
+
+    dre = dre_periodo(inicio, fim)
+    df = resumo_periodo(inicio, fim)
+    est = estoque_df()
+    estoque_baixo = est[est["Qtd Atual"] <= est["Estoque Mínimo"]].copy() if not est.empty else pd.DataFrame()
+
+    receita = float(dre.get("receita", 0) or 0)
+    cmv_pct = float(dre.get("cmv_pct", 0) or 0)
+    perdas = float(dre.get("perdas", 0) or 0)
+    lucro_operacional = float(dre.get("lucro_operacional", 0) or 0)
+
+    alertas = []
+    acoes = []
+
+    def add_alerta(nivel, titulo, texto):
+        alertas.append({"nivel": nivel, "titulo": titulo, "texto": texto})
+
+    def add_acao(titulo, texto):
+        acoes.append({"titulo": titulo, "texto": texto})
+
+    # CMV atual e projeção simples do mês/ritmo atual
+    if receita <= 0:
+        add_alerta("atenção", "Sem vendas no período", "Ainda não existe base suficiente para analisar CMV, margem e produtos.")
+        add_acao("Registrar vendas", "Lance as vendas do dia para liberar a leitura real do painel executivo.")
+    elif cmv_pct >= critica_cmv:
+        add_alerta("crítico", "CMV crítico", f"CMV em {format_pct(cmv_pct)}, acima da faixa crítica de {format_pct(critica_cmv)}.")
+        add_acao("Revisar CMV hoje", "Verifique compras recentes, perdas, ficha técnica e produtos vendidos com preço defasado.")
+    elif cmv_pct >= alerta_cmv:
+        add_alerta("atenção", "CMV em atenção", f"CMV em {format_pct(cmv_pct)}, acima da meta de {format_pct(meta_cmv)}.")
+        add_acao("Atacar produtos vilões", "Abra produtos com CMV alto e priorize reprecificação ou negociação com fornecedor.")
+    elif cmv_pct > meta_cmv:
+        add_alerta("atenção", "CMV acima da meta", f"CMV em {format_pct(cmv_pct)}, um pouco acima da meta de {format_pct(meta_cmv)}.")
+    else:
+        add_alerta("ok", "CMV saudável", f"CMV em {format_pct(cmv_pct)}, dentro da meta de {format_pct(meta_cmv)}.")
+
+    # Projeção de fechamento usando o ritmo atual do período selecionado
+    if receita > 0:
+        add_alerta("projeção", "Projeção de CMV", f"Se o ritmo atual continuar, o CMV tende a fechar próximo de {format_pct(cmv_pct)}.")
+        if cmv_pct > meta_cmv:
+            add_acao("Corrigir antes do fechamento", "Como o CMV projetado está acima da meta, aja agora antes de fechar o mês no vermelho.")
+
+    # Resultado operacional
+    if receita > 0 and lucro_operacional < 0:
+        add_alerta("crítico", "DRE negativo", f"Lucro operacional está negativo em {moeda(lucro_operacional)}.")
+        add_acao("Separar preço, CMV e despesas", "Veja se o lucro bruto some por causa das despesas ou se o problema nasce no custo dos produtos.")
+    elif receita > 0 and lucro_operacional > 0:
+        margem_op = lucro_operacional / receita * 100
+        add_alerta("ok", "Resultado operacional positivo", f"Lucro operacional positivo com margem de {format_pct(margem_op)}.")
+
+    # Perdas e consumo interno
+    if receita > 0 and perdas > 0:
+        perdas_pct = perdas / receita * 100
+        nivel = "crítico" if perdas_pct >= 5 else "atenção"
+        add_alerta(nivel, "Perdas/consumo interno", f"Impacto de {format_pct(perdas_pct)} da receita no período.")
+        add_acao("Cortar desperdício", "Filtre movimentações por Perda, Consumo Interno e Ajuste para cobrar motivo e responsável.")
+
+    # Estoque crítico
+    if not estoque_baixo.empty:
+        pior = estoque_baixo.sort_values("Qtd Atual").iloc[0]
+        add_alerta("atenção", "Estoque crítico", f"{len(estoque_baixo)} produto(s) abaixo ou no mínimo. Primeiro item: {pior['Produto']}.")
+        add_acao("Comprar antes de perder venda", f"Priorize reposição de {pior['Produto']} e dos itens com maior saída.")
+
+    # Produtos: margem ruim e oportunidades
+    prod = pd.DataFrame()
+    if df is not None and not df.empty:
+        vendas = df[df["TipoSaida"] == "Venda"].copy()
+        if not vendas.empty:
+            prod = vendas.groupby("Produto", as_index=False).agg(
+                Receita=("Receita", "sum"),
+                CMV=("CMV", "sum"),
+                Quantidade=("Quantidade", "sum"),
+            )
+            prod["Lucro Bruto"] = prod["Receita"] - prod["CMV"]
+            prod["CMV %"] = prod.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+            prod["Margem %"] = prod.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+
+    if not prod.empty:
+        campeoes = prod.sort_values("Quantidade", ascending=False).head(5)
+        ruins = campeoes[campeoes["CMV %"] > meta_cmv]
+        if not ruins.empty:
+            item = ruins.sort_values("CMV %", ascending=False).iloc[0]
+            add_alerta("crítico", "Produto campeão com margem ruim", f"{item['Produto']} vende bem, mas está com CMV de {format_pct(item['CMV %'])}.")
+            add_acao("Reprecificar campeão", f"Revise preço, ficha técnica ou fornecedor de {item['Produto']}.")
+
+        # Oportunidade: margem boa, mas venda baixa dentro dos produtos vendidos
+        margem_boa = prod[(prod["CMV %"] > 0) & (prod["CMV %"] <= meta_cmv) & (prod["Margem %"] >= 55)]
+        if not margem_boa.empty:
+            med_qtd = prod["Quantidade"].median()
+            oportunidade = margem_boa[margem_boa["Quantidade"] <= med_qtd]
+            if not oportunidade.empty:
+                item = oportunidade.sort_values("Margem %", ascending=False).iloc[0]
+                add_alerta("oportunidade", "Produto bom para promoção", f"{item['Produto']} tem margem alta e baixa saída relativa.")
+                add_acao("Promover produto saudável", f"Use {item['Produto']} em combo, vitrine ou sugestão ativa para puxar lucro.")
+
+        # Produto que mais contribui com lucro
+        top_lucro = prod.sort_values("Lucro Bruto", ascending=False).head(1)
+        if not top_lucro.empty and float(top_lucro.iloc[0]["Lucro Bruto"]) > 0:
+            add_alerta("ok", "Produto mais lucrativo", f"{top_lucro.iloc[0]['Produto']} é o maior gerador de lucro bruto no período.")
+
+    # Monta mensagem compacta para WhatsApp
+    icone = {"crítico": "🔴", "atenção": "🟡", "ok": "🟢", "projeção": "📈", "oportunidade": "💡"}
+    linhas_alertas = []
+    for a in alertas[:6]:
+        linhas_alertas.append(f"{icone.get(a['nivel'], '•')} {a['titulo']}: {a['texto']}")
+
+    linhas_acoes = []
+    for a in acoes[:4]:
+        linhas_acoes.append(f"➡️ {a['titulo']}: {a['texto']}")
+
+    mensagem = f"""🚨 ALERTA INTELIGENTE ERP RESTAURANTE
+
+{nome_empresa}
+Data: {date.today().strftime('%d/%m/%Y')}
+
+Resumo:
+• Receita: {moeda(receita)}
+• CMV: {format_pct(cmv_pct)} | Meta: {format_pct(meta_cmv)}
+• Lucro operacional: {moeda(lucro_operacional)}
+• Estoque crítico: {len(estoque_baixo)} produto(s)
+
+Alertas:
+{chr(10).join(linhas_alertas) if linhas_alertas else 'Nenhum alerta crítico no momento.'}
+
+O que fazer:
+{chr(10).join(linhas_acoes) if linhas_acoes else 'Manter rotina de acompanhamento diário.'}"""
+
+    return {
+        "alertas": alertas,
+        "acoes": acoes,
+        "mensagem_whatsapp": mensagem,
+        "dre": dre,
+        "produtos": prod,
+        "estoque_baixo": estoque_baixo,
+    }
+
+
+# =========================================================
+# PROJEÇÃO FINANCEIRA / OPERACIONAL
+# =========================================================
+def projecao_financeira_mes(inicio=None, fim=None):
+    """Calcula projeção simples do mês atual com base no ritmo realizado até hoje."""
+    hoje_ts = pd.Timestamp(date.today())
+    mes_inicio = pd.Timestamp(hoje_ts.year, hoje_ts.month, 1)
+    mes_fim = pd.Timestamp(hoje_ts.year + 1, 1, 1) if hoje_ts.month == 12 else pd.Timestamp(hoje_ts.year, hoje_ts.month + 1, 1)
+
+    inicio_mes = str(mes_inicio.date())
+    fim_mes = str(mes_fim.date())
+    fim_realizado = str((hoje_ts + pd.Timedelta(days=1)).date())
+
+    dre_realizado = dre_periodo(inicio_mes, fim_realizado)
+    df_realizado = resumo_periodo(inicio_mes, fim_realizado)
+
+    dias_no_mes = int((mes_fim - mes_inicio).days)
+    dia_atual = min(int(hoje_ts.day), dias_no_mes)
+    fator = dias_no_mes / dia_atual if dia_atual > 0 else 1
+
+    receita_realizada = float(dre_realizado.get("receita", 0) or 0)
+    cmv_realizado = float(dre_realizado.get("cmv_total", 0) or 0)
+    perdas_realizadas = float(dre_realizado.get("perdas", 0) or 0)
+    despesas_realizadas = float(dre_realizado.get("despesas", 0) or 0)
+    lucro_realizado = float(dre_realizado.get("lucro_operacional", 0) or 0)
+
+    receita_proj = receita_realizada * fator
+    cmv_proj = cmv_realizado * fator
+    perdas_proj = perdas_realizadas * fator
+    despesas_proj = despesas_realizadas * fator
+    lucro_bruto_proj = receita_proj - cmv_proj
+    lucro_operacional_proj = lucro_bruto_proj - despesas_proj
+
+    cmv_pct_proj = (cmv_proj / receita_proj * 100) if receita_proj else 0
+    margem_op_proj = (lucro_operacional_proj / receita_proj * 100) if receita_proj else 0
+
+    meta_cmv = get_float_config("meta_cmv_ideal", META_CMV)
+    critica_cmv = get_float_config("meta_cmv_critica", meta_cmv + 8)
+
+    if receita_realizada <= 0:
+        tendencia = "Sem dados"
+        nivel = "atenção"
+        resumo = "Ainda não há vendas suficientes no mês para projetar o fechamento."
+    elif lucro_operacional_proj < 0 or cmv_pct_proj >= critica_cmv:
+        tendencia = "Crítica"
+        nivel = "crítico"
+        resumo = "O mês tende a fechar com risco alto: CMV elevado ou resultado operacional negativo."
+    elif cmv_pct_proj > meta_cmv or margem_op_proj < 10:
+        tendencia = "Atenção"
+        nivel = "atenção"
+        resumo = "O mês tende a fechar com pontos de atenção. Corrigir agora melhora o fechamento."
+    else:
+        tendencia = "Saudável"
+        nivel = "ok"
+        resumo = "O ritmo atual indica fechamento saudável dentro dos principais parâmetros."
+
+    recomendacoes = []
+    if receita_realizada <= 0:
+        recomendacoes.append("Lançar vendas do dia para liberar a projeção real do mês.")
+    if cmv_pct_proj > meta_cmv:
+        recomendacoes.append("Revisar produtos com CMV alto e fornecedores antes do fechamento mensal.")
+    if lucro_operacional_proj < 0:
+        recomendacoes.append("Separar o problema entre preço, CMV e despesas para evitar fechar o mês no prejuízo.")
+    if perdas_proj > 0 and receita_proj > 0 and (perdas_proj / receita_proj * 100) >= 3:
+        recomendacoes.append("Controlar perdas e consumo interno, pois estão pressionando o resultado projetado.")
+    if not recomendacoes:
+        recomendacoes.append("Manter acompanhamento diário de CMV, estoque crítico e margem por produto.")
+
+    return {
+        "dias_no_mes": dias_no_mes,
+        "dia_atual": dia_atual,
+        "fator": fator,
+        "receita_realizada": receita_realizada,
+        "receita_proj": receita_proj,
+        "cmv_proj": cmv_proj,
+        "cmv_pct_proj": cmv_pct_proj,
+        "perdas_proj": perdas_proj,
+        "despesas_proj": despesas_proj,
+        "lucro_bruto_proj": lucro_bruto_proj,
+        "lucro_operacional_proj": lucro_operacional_proj,
+        "margem_op_proj": margem_op_proj,
+        "tendencia": tendencia,
+        "nivel": nivel,
+        "resumo": resumo,
+        "recomendacoes": recomendacoes,
+    }
+
+# =========================================================
+# WHATSAPP / Z-API
+# =========================================================
+ZAPI_INSTANCE = "3F3825B4243AF30BEB028E55E4F73592"
+ZAPI_TOKEN = "A90F201DAC1257487E0191F8"
+
+# Em algumas contas da Z-API existe também o Client-Token.
+# Se sua conta exigir, coloque esse token em Configurações depois.
+ZAPI_CLIENT_TOKEN_PADRAO = ""
+
+
+def limpar_numero_whatsapp(numero):
+    numero = str(numero or "").strip()
+    numero = numero.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    numero = re.sub(r"\D", "", numero)
+    return numero
+
+
+def enviar_whatsapp_zapi(numero, mensagem):
+    numero = limpar_numero_whatsapp(numero)
+
+    if not numero:
+        return False, "Número de WhatsApp não informado."
+
+    if len(numero) < 12:
+        return False, "Número inválido. Use o formato com DDI e DDD. Exemplo: 5521999999999."
+
+    url = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
+
+    client_token = get_config("zapi_client_token", ZAPI_CLIENT_TOKEN_PADRAO).strip()
+
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    payload = {
+        "phone": numero,
+        "message": mensagem
+    }
+
+    try:
+        resposta = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resposta.status_code in (200, 201):
+            return True, "Mensagem enviada com sucesso."
+
+        detalhe = resposta.text[:500] if resposta.text else ""
+        return False, f"Erro Z-API {resposta.status_code}: {detalhe}"
+
+    except Exception as e:
+        return False, f"Erro ao conectar na Z-API: {e}"
+
 # =========================================================
 # DASHBOARD PREMIUM
 # =========================================================
@@ -998,6 +1288,7 @@ def menus_por_perfil():
 
     todos = [
         "Painel CMV",
+        "📱 Executivo Mobile",
         "Precificação",
         "DRE Gerencial",
         "Curva ABC",
@@ -1023,6 +1314,7 @@ def menus_por_perfil():
     if tipo == "financeiro":
         return [
             "Painel CMV",
+            "📱 Executivo Mobile",
             "Precificação",
             "DRE Gerencial",
             "Curva ABC",
@@ -1287,6 +1579,782 @@ if menu == "Painel CMV":
         base["Margem %"] = base.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
         st.dataframe(base, use_container_width=True, hide_index=True)
 
+
+
+# =========================================================
+# EXECUTIVO MOBILE V2
+# =========================================================
+elif menu == "📱 Executivo Mobile":
+    st.markdown("""
+        <style>
+            .block-container {padding-top: 0.7rem; padding-left: 0.85rem; padding-right: 0.85rem; max-width: 980px;}
+            [data-testid="stSidebar"] {min-width: 250px;}
+            .exec-hero {
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 52%, #334155 100%);
+                color: white;
+                padding: 22px 20px;
+                border-radius: 26px;
+                margin-bottom: 15px;
+                box-shadow: 0 14px 34px rgba(15,23,42,.20);
+            }
+            .exec-title {font-size: 28px; line-height:1.05; font-weight: 950; margin-bottom:6px;}
+            .exec-sub {font-size: 13px; color:#cbd5e1; font-weight:600;}
+            .exec-pill {display:inline-block; background:rgba(255,255,255,.13); color:white; border:1px solid rgba(255,255,255,.18); border-radius:99px; padding:6px 10px; margin-top:13px; font-size:12px; font-weight:800;}
+            .kpi-card {
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 22px;
+                padding: 17px 16px;
+                margin-bottom: 10px;
+                box-shadow: 0 8px 26px rgba(15, 23, 42, 0.075);
+                min-height: 112px;
+            }
+            .kpi-label {font-size: 12px; color:#64748b; font-weight:800; margin-bottom:7px; text-transform:uppercase; letter-spacing:.02em;}
+            .kpi-value {font-size: 26px; color:#0f172a; font-weight:950; line-height:1.05;}
+            .kpi-help {font-size: 12px; color:#64748b; margin-top:7px; font-weight:600;}
+            .tone-blue {border-left: 6px solid #2563eb;}
+            .tone-red {border-left: 6px solid #ef4444;}
+            .tone-green {border-left: 6px solid #22c55e;}
+            .tone-orange {border-left: 6px solid #f97316;}
+            .tone-purple {border-left: 6px solid #7c3aed;}
+            .section-title {font-size:19px; font-weight:950; color:#0f172a; margin:24px 0 10px 0;}
+            .alert-card {border-radius:18px; padding:14px 15px; margin-bottom:10px; font-size:14px; font-weight:800; box-shadow: 0 6px 16px rgba(15,23,42,.05);}
+            .alert-good {background:#f0fdf4; border-left:6px solid #22c55e; color:#166534;}
+            .alert-warn {background:#fffbeb; border-left:6px solid #f59e0b; color:#92400e;}
+            .alert-bad {background:#fef2f2; border-left:6px solid #ef4444; color:#991b1b;}
+            .insight-card {background:#ffffff; border:1px solid #e5e7eb; border-radius:20px; padding:15px; margin-bottom:10px; box-shadow: 0 6px 18px rgba(15,23,42,.06);}
+            .insight-title {font-size:14px; font-weight:900; color:#0f172a; margin-bottom:4px;}
+            .insight-text {font-size:13px; color:#475569; font-weight:600;}
+            .score-card {
+                background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+                border: 1px solid #e5e7eb;
+                border-radius: 26px;
+                padding: 20px 18px;
+                margin: 14px 0 16px 0;
+                box-shadow: 0 12px 32px rgba(15,23,42,.10);
+            }
+            .score-number {font-size:44px; font-weight:950; line-height:1; color:#0f172a;}
+            .score-label {font-size:15px; font-weight:950; color:#0f172a; margin-top:6px;}
+            .score-sub {font-size:12px; color:#64748b; font-weight:700; margin-top:5px;}
+            .score-bar-bg {height:12px; background:#e5e7eb; border-radius:99px; overflow:hidden; margin-top:14px;}
+            .score-bar-fill {height:12px; border-radius:99px;}
+            .score-reason {font-size:12px; color:#475569; font-weight:700; margin-top:8px;}
+            .forecast-card {background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%); color:white; border-radius:26px; padding:18px; margin:14px 0 16px 0; box-shadow:0 12px 32px rgba(15,23,42,.16);}
+            .forecast-title {font-size:18px; font-weight:950; margin-bottom:6px;}
+            .forecast-sub {font-size:12px; color:#cbd5e1; font-weight:700; margin-bottom:14px;}
+            .forecast-grid {display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+            .forecast-kpi {background:rgba(255,255,255,.09); border:1px solid rgba(255,255,255,.15); border-radius:18px; padding:12px;}
+            .forecast-label {font-size:11px; color:#cbd5e1; font-weight:800; text-transform:uppercase;}
+            .forecast-value {font-size:22px; font-weight:950; margin-top:4px;}
+            .forecast-action {background:#fff7ed; border-left:5px solid #f97316; color:#9a3412; padding:10px 12px; border-radius:14px; margin-top:10px; font-size:13px; font-weight:800;}
+            @media (max-width: 720px) {
+                .block-container {padding-left: .55rem; padding-right: .55rem;}
+                .exec-title {font-size:24px;}
+                .kpi-value {font-size:24px;}
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    hoje = date.today()
+    nome_empresa = get_config("nome_empresa", "Restaurante")
+    meta_cmv = get_float_config("meta_cmv_ideal", META_CMV)
+    alerta_cmv = get_float_config("meta_cmv_alerta", meta_cmv + 4)
+    critica_cmv = get_float_config("meta_cmv_critica", meta_cmv + 8)
+
+    periodo_mobile = st.selectbox(
+        "Período para análise",
+        ["Hoje", "Últimos 7 dias", "Últimos 30 dias", "Este mês", "Personalizado"],
+        index=3,
+        key="mobile_periodo_v2"
+    )
+
+    data_ini_mob = hoje.replace(day=1)
+    data_fim_mob = hoje
+    if periodo_mobile == "Personalizado":
+        c_ini, c_fim = st.columns(2)
+        data_ini_mob = c_ini.date_input("Data inicial", value=data_ini_mob, key="mob_ini_v2")
+        data_fim_mob = c_fim.date_input("Data final", value=data_fim_mob, key="mob_fim_v2")
+
+    inicio_periodo, fim_periodo = datas_periodo(periodo_mobile, data_ini_mob, data_fim_mob)
+    label_periodo = periodo_label(inicio_periodo, fim_periodo)
+
+    inicio_hoje = str(hoje)
+    fim_amanha = str(pd.Timestamp(hoje) + pd.Timedelta(days=1))[:10]
+
+    df_periodo = resumo_periodo(inicio_periodo, fim_periodo)
+    df_hoje = resumo_periodo(inicio_hoje, fim_amanha)
+    est = estoque_df()
+    dre = dre_periodo(inicio_periodo, fim_periodo)
+
+    receita_periodo = df_periodo.loc[df_periodo["TipoSaida"] == "Venda", "Receita"].sum() if not df_periodo.empty else 0
+    cmv_periodo = df_periodo["CMV"].sum() if not df_periodo.empty else 0
+    perdas_periodo = df_periodo.loc[df_periodo["TipoSaida"] != "Venda", "CMV"].sum() if not df_periodo.empty else 0
+    lucro_periodo = receita_periodo - cmv_periodo
+    cmv_pct_periodo = (cmv_periodo / receita_periodo * 100) if receita_periodo else 0
+    margem_periodo = (lucro_periodo / receita_periodo * 100) if receita_periodo else 0
+
+    receita_hoje = df_hoje.loc[df_hoje["TipoSaida"] == "Venda", "Receita"].sum() if not df_hoje.empty else 0
+    cmv_hoje = df_hoje["CMV"].sum() if not df_hoje.empty else 0
+    perdas_hoje = df_hoje.loc[df_hoje["TipoSaida"] != "Venda", "CMV"].sum() if not df_hoje.empty else 0
+    lucro_hoje = receita_hoje - cmv_hoje
+    cmv_pct_hoje = (cmv_hoje / receita_hoje * 100) if receita_hoje else 0
+
+    vendas_periodo = df_periodo[df_periodo["TipoSaida"] == "Venda"].copy() if not df_periodo.empty else pd.DataFrame()
+    qtd_vendas = vendas_periodo["Quantidade"].sum() if not vendas_periodo.empty else 0
+    ticket_medio = receita_periodo / qtd_vendas if qtd_vendas else 0
+
+    estoque_valor = est["Valor Estoque"].sum() if not est.empty else 0
+    estoque_baixo = est[est["Alerta"] == "⚠️ Baixo"].copy() if not est.empty else pd.DataFrame()
+
+    status_texto = "Saudável"
+    status_tom = "🟢"
+    if receita_periodo <= 0:
+        status_texto = "Sem vendas"
+        status_tom = "🟡"
+    elif cmv_pct_periodo >= critica_cmv or dre["lucro_operacional"] < 0:
+        status_texto = "Crítico"
+        status_tom = "🔴"
+    elif cmv_pct_periodo > meta_cmv or len(estoque_baixo) > 0 or perdas_periodo > 0:
+        status_texto = "Atenção"
+        status_tom = "🟡"
+
+    # Score executivo da loja: transforma a operação em uma nota simples para o dono.
+    score_loja = 100
+    motivos_score = []
+
+    if receita_periodo <= 0:
+        score_loja -= 25
+        motivos_score.append("sem vendas registradas no período")
+    else:
+        excesso_cmv = max(0, cmv_pct_periodo - meta_cmv)
+        if excesso_cmv > 0:
+            perda_score_cmv = min(30, int(excesso_cmv * 2))
+            score_loja -= perda_score_cmv
+            motivos_score.append(f"CMV {format_pct(cmv_pct_periodo)} acima da meta")
+
+    if dre["lucro_operacional"] < 0:
+        score_loja -= 20
+        motivos_score.append("DRE operacional negativo")
+
+    if receita_periodo > 0 and perdas_periodo > 0:
+        perda_pct_score = perdas_periodo / receita_periodo * 100
+        penalidade_perda = min(15, int(perda_pct_score * 2))
+        score_loja -= penalidade_perda
+        motivos_score.append(f"perdas representam {format_pct(perda_pct_score)} da receita")
+
+    if len(estoque_baixo) > 0:
+        penalidade_estoque = min(15, len(estoque_baixo) * 3)
+        score_loja -= penalidade_estoque
+        motivos_score.append(f"{len(estoque_baixo)} produto(s) em estoque crítico")
+
+    if ticket_medio <= 0 and receita_periodo > 0:
+        score_loja -= 5
+        motivos_score.append("ticket médio sem leitura adequada")
+
+    score_loja = max(0, min(100, int(score_loja)))
+
+    if score_loja >= 90:
+        score_status = "Excelente"
+        score_emoji = "🟢"
+        score_cor = "#22c55e"
+    elif score_loja >= 75:
+        score_status = "Saudável"
+        score_emoji = "🟢"
+        score_cor = "#16a34a"
+    elif score_loja >= 55:
+        score_status = "Atenção"
+        score_emoji = "🟡"
+        score_cor = "#f59e0b"
+    else:
+        score_status = "Crítica"
+        score_emoji = "🔴"
+        score_cor = "#ef4444"
+
+    motivos_score_txt = " • ".join(motivos_score[:3]) if motivos_score else "operação dentro dos principais parâmetros acompanhados"
+
+    st.markdown(f"""
+        <div class="exec-hero">
+            <div class="exec-title">{status_tom} Painel do Dono</div>
+            <div class="exec-sub">{nome_empresa} • mapa da operação para decidir rápido, sem depender de relatório do gerente.</div>
+            <div class="exec-pill">Status: {status_texto} • {label_periodo}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(f"""
+        <div class="score-card">
+            <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start;">
+                <div>
+                    <div class="score-number">{score_loja}<span style="font-size:18px; color:#64748b;">/100</span></div>
+                    <div class="score-label">{score_emoji} Saúde da loja: {score_status}</div>
+                    <div class="score-sub">Nota automática baseada em CMV, margem, perdas, estoque crítico e resultado.</div>
+                </div>
+                <div style="font-size:12px; font-weight:900; color:{score_cor}; background:rgba(15,23,42,.04); padding:7px 10px; border-radius:999px; white-space:nowrap;">{score_status}</div>
+            </div>
+            <div class="score-bar-bg"><div class="score-bar-fill" style="width:{score_loja}%; background:{score_cor};"></div></div>
+            <div class="score-reason">Principais leituras: {motivos_score_txt}.</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    def kpi(label, value, help_text="", tone="blue"):
+        st.markdown(f"""
+            <div class="kpi-card tone-{tone}">
+                <div class="kpi-label">{label}</div>
+                <div class="kpi-value">{value}</div>
+                <div class="kpi-help">{help_text}</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'>📌 Resumo executivo</div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        kpi("Faturamento", moeda(receita_periodo), "Receita no período", "blue")
+    with c2:
+        tom_cmv = "green" if cmv_pct_periodo <= meta_cmv and receita_periodo > 0 else "red"
+        kpi("CMV", format_pct(cmv_pct_periodo), f"Meta mensal: {format_pct(meta_cmv)}", tom_cmv)
+    c3, c4 = st.columns(2)
+    with c3:
+        kpi("Lucro bruto", moeda(lucro_periodo), f"Margem: {format_pct(margem_periodo)}", "green" if lucro_periodo >= 0 else "red")
+    with c4:
+        kpi("Perdas", moeda(perdas_periodo), "Perda, consumo e ajuste", "orange" if perdas_periodo > 0 else "green")
+    c5, c6 = st.columns(2)
+    with c5:
+        kpi("Ticket médio", moeda(ticket_medio), "Receita ÷ quantidade vendida", "purple")
+    with c6:
+        kpi("Estoque", moeda(estoque_valor), f"{len(estoque_baixo)} produto(s) críticos", "orange" if len(estoque_baixo) else "green")
+
+    st.markdown("<div class='section-title'>⏱ Hoje</div>", unsafe_allow_html=True)
+    h1, h2 = st.columns(2)
+    with h1:
+        kpi("Venda hoje", moeda(receita_hoje), "Faturamento do dia", "blue")
+    with h2:
+        kpi("CMV hoje", format_pct(cmv_pct_hoje), moeda(cmv_hoje), "green" if cmv_pct_hoje <= meta_cmv and receita_hoje > 0 else "red")
+    h3, h4 = st.columns(2)
+    with h3:
+        kpi("Lucro hoje", moeda(lucro_hoje), "Receita - CMV", "green" if lucro_hoje >= 0 else "red")
+    with h4:
+        kpi("Perdas hoje", moeda(perdas_hoje), "Impacto operacional", "orange" if perdas_hoje > 0 else "green")
+
+    st.markdown("<div class='section-title'>🚨 Central inteligente de alertas</div>", unsafe_allow_html=True)
+
+    # Motor simples de alertas executivos: transforma número em decisão.
+    alertas_exec = []
+    acoes_exec = []
+
+    def add_alerta(nivel, titulo, texto):
+        # nivel: bad, warn, good
+        icone = {"bad": "🔴", "warn": "🟡", "good": "🟢"}.get(nivel, "🟡")
+        classe = {"bad": "alert-bad", "warn": "alert-warn", "good": "alert-good"}.get(nivel, "alert-warn")
+        alertas_exec.append((classe, f"{icone} {titulo}: {texto}"))
+
+    def add_acao(titulo, texto):
+        acoes_exec.append((titulo, texto))
+
+    # Ranking de produtos para inteligência
+    prod_mobile = pd.DataFrame()
+    if not vendas_periodo.empty:
+        prod_mobile = vendas_periodo.groupby("Produto", as_index=False).agg(
+            Receita=("Receita", "sum"),
+            CMV=("CMV", "sum"),
+            Quantidade=("Quantidade", "sum")
+        )
+        prod_mobile["Lucro Bruto"] = prod_mobile["Receita"] - prod_mobile["CMV"]
+        prod_mobile["CMV %"] = prod_mobile.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+        prod_mobile["Margem %"] = prod_mobile.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+
+    # 0) Score geral
+    if score_loja < 55:
+        add_alerta("bad", "Saúde da loja crítica", f"score {score_loja}/100. Prioridade: corrigir CMV, perdas e resultado antes de pensar em crescimento.")
+        add_acao("Plano de choque da loja", "Comece pelo maior vilão: CMV, perdas ou DRE negativo. O score mostra que a operação precisa de ação imediata.")
+    elif score_loja < 75:
+        add_alerta("warn", "Saúde da loja em atenção", f"score {score_loja}/100. A loja ainda opera, mas existem pontos que podem virar prejuízo.")
+    else:
+        add_alerta("good", "Saúde da loja positiva", f"score {score_loja}/100. Mantenha a rotina de acompanhamento e ataque pequenas oportunidades.")
+
+    # 1) CMV
+    if receita_periodo <= 0:
+        add_alerta("warn", "Sem leitura de vendas", "lance vendas para liberar análise real de CMV, margem e produtos.")
+        add_acao("Começar pela base", "Registre as vendas do dia para o painel conseguir apontar margem, CMV e produtos críticos.")
+    elif cmv_pct_periodo >= critica_cmv:
+        diferenca = cmv_pct_periodo - meta_cmv
+        add_alerta("bad", "CMV crítico", f"{format_pct(cmv_pct_periodo)} está {format_pct(diferenca)} acima da meta mensal de {format_pct(meta_cmv)}.")
+        add_acao("Reunião rápida com gerente", "Pergunte hoje: quais produtos tiveram perda, quais compras encareceram e quais vendas estão com preço defasado.")
+    elif cmv_pct_periodo > meta_cmv:
+        diferenca = cmv_pct_periodo - meta_cmv
+        add_alerta("warn", "CMV acima da meta", f"{format_pct(cmv_pct_periodo)} está {format_pct(diferenca)} acima da meta mensal.")
+        add_acao("Atacar os vilões do CMV", "Abra a aba 'CMV alto' e revise os produtos que estão puxando o percentual para cima.")
+    else:
+        add_alerta("good", "CMV saudável", f"{format_pct(cmv_pct_periodo)} dentro da meta de {format_pct(meta_cmv)}.")
+
+    # 2) Perdas
+    if receita_periodo > 0 and perdas_periodo > 0:
+        perda_pct = perdas_periodo / receita_periodo * 100
+        if perda_pct > 5:
+            add_alerta("bad", "Perdas altas", f"perdas/consumo/ajustes equivalem a {format_pct(perda_pct)} da receita.")
+            add_acao("Cortar desperdício", "Filtre movimentações por perda, consumo interno e ajuste. Cobre motivo e responsável por cada lançamento.")
+        else:
+            add_alerta("warn", "Perdas em atenção", f"impacto de {format_pct(perda_pct)} da receita no período.")
+            add_acao("Monitorar perdas", "Acompanhe diariamente se o valor de perdas continua subindo ou foi um evento pontual.")
+
+    # 3) Estoque crítico
+    if len(estoque_baixo) > 0:
+        top_critico = estoque_baixo.sort_values("Qtd Atual").head(1)
+        nome_critico = top_critico.iloc[0]["Produto"] if not top_critico.empty else "produto crítico"
+        add_alerta("warn", "Risco de ruptura", f"{len(estoque_baixo)} produto(s) em estoque crítico. Primeiro item: {nome_critico}.")
+        add_acao("Comprar antes de perder venda", "Priorize os itens críticos com maior saída e maior margem.")
+    else:
+        add_alerta("good", "Estoque sem ruptura", "nenhum produto abaixo do estoque mínimo.")
+
+    # 4) DRE
+    if dre["receita"] > 0 and dre["lucro_operacional"] < 0:
+        add_alerta("bad", "Prejuízo operacional", "o DRE do período está negativo depois de CMV e despesas.")
+        add_acao("Revisar resultado", "Separe o problema entre preço, CMV e despesas. Se o lucro bruto existe mas some no final, olhe despesas.")
+    elif dre["receita"] > 0 and dre["lucro_operacional"] > 0:
+        margem_op = dre["lucro_operacional"] / dre["receita"] * 100
+        add_alerta("good", "Resultado operacional", f"lucro operacional positivo com margem de {format_pct(margem_op)}.")
+
+    # 5) Produto campeão com margem ruim
+    if not prod_mobile.empty:
+        vendidos = prod_mobile.sort_values("Quantidade", ascending=False).head(5)
+        ruins = vendidos[vendidos["CMV %"] > meta_cmv]
+        if not ruins.empty:
+            p_ruim = ruins.sort_values("CMV %", ascending=False).iloc[0]
+            add_alerta("bad", "Produto campeão com margem ruim", f"{p_ruim['Produto']} vende bem, mas está com CMV de {format_pct(p_ruim['CMV %'])}.")
+            add_acao("Reprecificar campeão", f"Revise preço, ficha técnica ou fornecedor de {p_ruim['Produto']}. Produto que vende muito com margem ruim destrói lucro.")
+
+        bons = prod_mobile[(prod_mobile["CMV %"] <= meta_cmv) & (prod_mobile["Lucro Bruto"] > 0)]
+        if not bons.empty:
+            p_bom = bons.sort_values("Lucro Bruto", ascending=False).iloc[0]
+            add_acao("Promover produto saudável", f"{p_bom['Produto']} tem boa margem e lucro. Pode entrar em combo, destaque de vitrine ou sugestão ativa.")
+
+    for classe, texto in alertas_exec[:7]:
+        st.markdown(f"<div class='alert-card {classe}'>{texto}</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'>🧠 O que fazer hoje</div>", unsafe_allow_html=True)
+    if not acoes_exec:
+        acoes_exec.append(("Manter rotina", "Acompanhe CMV, perdas e estoque crítico diariamente. A operação está sem alerta grave no período."))
+
+    for titulo, texto in acoes_exec[:5]:
+        st.markdown(f"""
+            <div class="insight-card">
+                <div class="insight-title">{titulo}</div>
+                <div class="insight-text">{texto}</div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'>🤖 Motor automático de inteligência</div>", unsafe_allow_html=True)
+    inteligencia_mobile = gerar_alertas_inteligentes_erp(inicio_periodo, fim_periodo)
+    for alerta in inteligencia_mobile["alertas"][:6]:
+        nivel = alerta.get("nivel", "atenção")
+        if nivel == "crítico":
+            classe = "alert-bad"
+            ic = "🔴"
+        elif nivel == "ok":
+            classe = "alert-good"
+            ic = "🟢"
+        elif nivel == "oportunidade":
+            classe = "alert-warn"
+            ic = "💡"
+        elif nivel == "projeção":
+            classe = "alert-warn"
+            ic = "📈"
+        else:
+            classe = "alert-warn"
+            ic = "🟡"
+        st.markdown(
+            f"<div class='alert-card {classe}'>{ic} <b>{alerta.get('titulo','Alerta')}</b>: {alerta.get('texto','')}</div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("<div class='section-title'>🔮 Projeção inteligente do mês</div>", unsafe_allow_html=True)
+    proj = projecao_financeira_mes()
+    cor_tendencia = "#22c55e" if proj["nivel"] == "ok" else ("#ef4444" if proj["nivel"] == "crítico" else "#f59e0b")
+    st.markdown(f"""
+        <div class="forecast-card">
+            <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start;">
+                <div>
+                    <div class="forecast-title">🔮 Como o mês deve fechar</div>
+                    <div class="forecast-sub">Projeção baseada no ritmo realizado até o dia {proj['dia_atual']} de {proj['dias_no_mes']}.</div>
+                </div>
+                <div style="background:{cor_tendencia}; color:white; font-size:12px; font-weight:950; border-radius:999px; padding:7px 10px; white-space:nowrap;">{proj['tendencia']}</div>
+            </div>
+            <div class="forecast-grid">
+                <div class="forecast-kpi"><div class="forecast-label">Receita projetada</div><div class="forecast-value">{moeda(proj['receita_proj'])}</div></div>
+                <div class="forecast-kpi"><div class="forecast-label">Lucro previsto</div><div class="forecast-value">{moeda(proj['lucro_operacional_proj'])}</div></div>
+                <div class="forecast-kpi"><div class="forecast-label">CMV projetado</div><div class="forecast-value">{format_pct(proj['cmv_pct_proj'])}</div></div>
+                <div class="forecast-kpi"><div class="forecast-label">Margem operacional</div><div class="forecast-value">{format_pct(proj['margem_op_proj'])}</div></div>
+            </div>
+            <div style="font-size:13px; color:#e2e8f0; font-weight:800; margin-top:12px;">{proj['resumo']}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    for rec in proj["recomendacoes"][:3]:
+        st.markdown(f"<div class='forecast-action'>➡️ {rec}</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='section-title'>🤖 Consultor IA do Restaurante</div>", unsafe_allow_html=True)
+    st.caption("Pergunte qualquer coisa sobre CMV, DRE, PEPS, margem, estoque, perdas, produtos, lucro, projeção ou indicadores do sistema.")
+
+    # =====================================================
+    # IA CONSULTORA ROBUSTA — pergunta livre + base do ERP
+    # =====================================================
+    perguntas_rapidas = [
+        "O que devo fazer hoje?",
+        "O que é CMV?",
+        "Como calcula o CMV?",
+        "O que é DRE?",
+        "Por que meu lucro caiu?",
+        "Qual produto é mais lucrativo?",
+        "Qual produto vende mais?",
+        "Qual produto devo promover?",
+        "Quais produtos estão com margem ruim?",
+        "Como o mês deve fechar?",
+        "Onde estou perdendo dinheiro?",
+        "O que é PEPS?",
+        "O que é Curva ABC?",
+    ]
+
+    def montar_contexto_consultor_ia():
+        produtos_contexto = []
+        if not prod_mobile.empty:
+            base_prod = prod_mobile.copy().sort_values(["Lucro Bruto", "Receita"], ascending=[False, False]).head(15)
+            for _, r in base_prod.iterrows():
+                produtos_contexto.append({
+                    "produto": str(r.get("Produto", "")),
+                    "receita": round(float(r.get("Receita", 0) or 0), 2),
+                    "cmv": round(float(r.get("CMV", 0) or 0), 2),
+                    "cmv_pct": round(float(r.get("CMV %", 0) or 0), 2),
+                    "lucro_bruto": round(float(r.get("Lucro Bruto", 0) or 0), 2),
+                    "margem_pct": round(float(r.get("Margem %", 0) or 0), 2),
+                    "quantidade": round(float(r.get("Quantidade", 0) or 0), 2),
+                })
+
+        estoque_contexto = []
+        if not estoque_baixo.empty:
+            for _, r in estoque_baixo.head(12).iterrows():
+                estoque_contexto.append({
+                    "produto": str(r.get("Produto", "")),
+                    "qtd_atual": round(float(r.get("Qtd Atual", 0) or 0), 2),
+                    "estoque_minimo": round(float(r.get("Estoque Mínimo", 0) or 0), 2),
+                })
+
+        contexto = {
+            "empresa": nome_empresa,
+            "periodo": label_periodo,
+            "meta_cmv_pct": round(float(meta_cmv), 2),
+            "receita_periodo": round(float(receita_periodo), 2),
+            "cmv_periodo": round(float(cmv_periodo), 2),
+            "cmv_pct_periodo": round(float(cmv_pct_periodo), 2),
+            "lucro_bruto": round(float(lucro_periodo), 2),
+            "perdas": round(float(perdas_periodo), 2),
+            "ticket_medio": round(float(ticket_medio), 2),
+            "estoque_valor": round(float(estoque_valor), 2),
+            "estoque_critico_qtd": int(len(estoque_baixo)),
+            "dre": {
+                "receita": round(float(dre.get("receita", 0) or 0), 2),
+                "cmv_total": round(float(dre.get("cmv_total", 0) or 0), 2),
+                "lucro_bruto": round(float(dre.get("lucro_bruto", 0) or 0), 2),
+                "despesas": round(float(dre.get("despesas", 0) or 0), 2),
+                "lucro_operacional": round(float(dre.get("lucro_operacional", 0) or 0), 2),
+                "margem_operacional_pct": round(float(dre.get("margem_operacional_pct", 0) or 0), 2),
+            },
+            "projecao_mes": {
+                "receita_projetada": round(float(proj.get("receita_proj", 0) or 0), 2),
+                "lucro_operacional_projetado": round(float(proj.get("lucro_operacional_proj", 0) or 0), 2),
+                "cmv_pct_projetado": round(float(proj.get("cmv_pct_proj", 0) or 0), 2),
+                "margem_operacional_projetada": round(float(proj.get("margem_op_proj", 0) or 0), 2),
+                "tendencia": str(proj.get("tendencia", "")),
+            },
+            "produtos": produtos_contexto,
+            "estoque_critico": estoque_contexto,
+        }
+        return json.dumps(contexto, ensure_ascii=False, indent=2)
+
+    def resposta_base_conhecimento(pergunta):
+        p = str(pergunta or "").lower()
+
+        if "dre" in p:
+            return (
+                "**O que é DRE?**\n\n"
+                "DRE é a Demonstração do Resultado Gerencial. No seu ERP, ela mostra se o restaurante está dando lucro ou prejuízo no período.\n\n"
+                "**Como ler no sistema:**\n"
+                f"• Receita: {moeda(dre.get('receita', 0))}\n"
+                f"• CMV total: {moeda(dre.get('cmv_total', 0))}\n"
+                f"• Lucro bruto: {moeda(dre.get('lucro_bruto', 0))}\n"
+                f"• Despesas: {moeda(dre.get('despesas', 0))}\n"
+                f"• Lucro operacional: {moeda(dre.get('lucro_operacional', 0))}\n\n"
+                "**Fórmula simples:** Receita - CMV - Despesas = Lucro Operacional.\n\n"
+                "**Leitura prática:** se o lucro bruto é bom, mas o lucro operacional fica negativo, o problema provavelmente está nas despesas. Se o lucro bruto já é baixo, olhe CMV, preço e custo dos produtos."
+            )
+
+        if "cmv" in p:
+            return (
+                "**O que é CMV?**\n\n"
+                "CMV é o Custo da Mercadoria Vendida. Ele mostra quanto o restaurante gastou em produto/insumo para gerar as vendas.\n\n"
+                "**Como o sistema calcula:**\n"
+                "CMV % = custo das saídas pelo PEPS ÷ receita de venda × 100.\n\n"
+                f"**No seu período atual:**\n• CMV: {format_pct(cmv_pct_periodo)}\n• Meta: {format_pct(meta_cmv)}\n• Receita: {moeda(receita_periodo)}\n• CMV em R$: {moeda(cmv_periodo)}\n\n"
+                "**Leitura prática:** se o CMV passa da meta, pode indicar compra cara, preço defasado, desperdício, consumo interno, erro de ficha técnica ou perda operacional."
+            )
+
+        if "peps" in p:
+            return (
+                "**O que é PEPS?**\n\n"
+                "PEPS significa Primeiro que Entra, Primeiro que Sai. O sistema baixa primeiro os lotes mais antigos do estoque.\n\n"
+                "**Por que isso importa?**\n"
+                "Ajuda a calcular o custo real da venda e reduz risco de produto parado ou vencendo. Em restaurante, isso é importante para controlar CMV e validade."
+            )
+
+        if "curva abc" in p or "abc" in p:
+            return (
+                "**O que é Curva ABC?**\n\n"
+                "A Curva ABC separa os produtos por importância no resultado. Produtos A são os mais relevantes, produtos B têm impacto médio e produtos C têm menor impacto.\n\n"
+                "**Leitura prática:** o dono deve acompanhar de perto os produtos A, porque pequenas mudanças em preço, custo, estoque ou perda nesses itens mexem muito no lucro."
+            )
+
+        if "margem" in p:
+            return (
+                "**O que é margem?**\n\n"
+                "Margem é o percentual que sobra depois de descontar o custo do produto.\n\n"
+                "**Fórmula simples:** Margem Bruta % = Lucro Bruto ÷ Receita × 100.\n\n"
+                "**Leitura prática:** produto que vende muito, mas tem margem ruim, pode parecer bom no caixa e ruim no lucro."
+            )
+
+        if "ticket" in p:
+            return (
+                "**O que é ticket médio?**\n\n"
+                "Ticket médio é quanto, em média, cada venda ou item vendido gera de receita.\n\n"
+                f"No período atual, o ticket médio está em {moeda(ticket_medio)}.\n\n"
+                "**Leitura prática:** aumentar ticket médio com combos e produtos de boa margem melhora o resultado sem depender apenas de mais clientes."
+            )
+
+        return None
+
+    def resposta_dados_erp(pergunta):
+        p = str(pergunta or "").lower()
+
+        if not prod_mobile.empty and any(t in p for t in ["mais lucrativo", "maior lucro", "mais lucro", "produto lucrativo", "alimento lucrativo"]):
+            ranking = prod_mobile.sort_values("Lucro Bruto", ascending=False).head(5).copy()
+            melhor = ranking.iloc[0]
+            lista = "\n".join([f"{i+1}. {r['Produto']} — lucro bruto {moeda(r['Lucro Bruto'])}, margem {format_pct(r['Margem %'])}" for i, r in ranking.reset_index(drop=True).iterrows()])
+            return f"**Produto mais lucrativo:** {melhor['Produto']}\n\n{lista}\n\n**Ação:** dê destaque ao produto mais lucrativo, mas acompanhe estoque e capacidade de produção."
+
+        if not prod_mobile.empty and any(t in p for t in ["mais vendido", "vende mais", "campeão de venda", "campeao de venda"]):
+            ranking = prod_mobile.sort_values("Quantidade", ascending=False).head(5).copy()
+            melhor = ranking.iloc[0]
+            lista = "\n".join([f"{i+1}. {r['Produto']} — {r['Quantidade']:.0f} un., receita {moeda(r['Receita'])}, CMV {format_pct(r['CMV %'])}" for i, r in ranking.reset_index(drop=True).iterrows()])
+            return f"**Produto mais vendido:** {melhor['Produto']}\n\n{lista}\n\n**Ação:** se o campeão de venda tiver CMV alto, revise preço, custo ou ficha técnica."
+
+        if not prod_mobile.empty and any(t in p for t in ["pior margem", "margem ruim", "baixa margem", "menor margem"]):
+            ranking = prod_mobile.sort_values("Margem %", ascending=True).head(5).copy()
+            pior = ranking.iloc[0]
+            lista = "\n".join([f"{i+1}. {r['Produto']} — margem {format_pct(r['Margem %'])}, CMV {format_pct(r['CMV %'])}" for i, r in ranking.reset_index(drop=True).iterrows()])
+            return f"**Produto com pior margem:** {pior['Produto']}\n\n{lista}\n\n**Ação:** revise preço de venda, custo de compra, porção/ficha técnica ou retire de promoção."
+
+        if len(estoque_baixo) > 0 and any(t in p for t in ["estoque", "comprar", "ruptura", "acabando", "repor"]):
+            ranking = estoque_baixo.sort_values("Qtd Atual").head(5).copy()
+            lista = "\n".join([f"{i+1}. {r['Produto']} — atual {r['Qtd Atual']} / mínimo {r['Estoque Mínimo']}" for i, r in ranking.reset_index(drop=True).iterrows()])
+            return f"**Itens com estoque crítico:**\n{lista}\n\n**Ação:** compre primeiro os itens críticos que também vendem bem ou têm boa margem."
+
+        if "preju" in p or "lucro caiu" in p or "resultado" in p or "perdendo dinheiro" in p:
+            return (
+                "**Leitura do resultado:**\n"
+                f"• Receita: {moeda(receita_periodo)}\n"
+                f"• CMV: {format_pct(cmv_pct_periodo)} contra meta de {format_pct(meta_cmv)}\n"
+                f"• Lucro bruto: {moeda(lucro_periodo)}\n"
+                f"• Lucro operacional: {moeda(dre.get('lucro_operacional', 0))}\n"
+                f"• Perdas/consumo/ajustes: {moeda(perdas_periodo)}\n\n"
+                "**Diagnóstico provável:** quando o lucro cai, normalmente é por CMV alto, despesa alta, preço defasado, perdas ou produto vendendo sem margem.\n\n"
+                "**Ação:** ataque primeiro CMV alto, produtos com pior margem, perdas e despesas do período."
+            )
+
+        if "mês" in p or "mes" in p or "proje" in p or "fechar" in p:
+            return (
+                "**Projeção do mês:**\n"
+                f"• Receita projetada: {moeda(proj.get('receita_proj', 0))}\n"
+                f"• Lucro operacional projetado: {moeda(proj.get('lucro_operacional_proj', 0))}\n"
+                f"• CMV projetado: {format_pct(proj.get('cmv_pct_proj', 0))}\n"
+                f"• Margem operacional projetada: {format_pct(proj.get('margem_op_proj', 0))}\n"
+                f"• Tendência: {proj.get('tendencia', '')}\n\n"
+                "**Ação:** se a tendência estiver em atenção ou crítica, revise CMV, despesas e produtos de margem ruim antes do fechamento."
+            )
+
+        if "hoje" in p or "fazer" in p or "ação" in p or "acao" in p:
+            return (
+                "**Prioridades para hoje:**\n"
+                "1. Revisar produtos com CMV acima da meta.\n"
+                "2. Conferir produtos com estoque crítico.\n"
+                "3. Verificar perdas, consumo interno e ajustes.\n"
+                "4. Promover produtos com boa margem e baixa saída.\n"
+                "5. Separar se o problema está em preço, custo, perda ou despesa."
+            )
+
+        return None
+
+    def consultar_ia_real_openai(pergunta):
+        api_key = get_config("openai_api_key", "").strip()
+        modelo = get_config("openai_model", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+        if not api_key:
+            return None, "IA real não configurada. Configure a chave em Configurações → OpenAI API Key."
+
+        contexto = montar_contexto_consultor_ia()
+        prompt = f"""
+Você é o Consultor IA de um ERP de restaurantes.
+Responda em português do Brasil, de forma clara, objetiva e prática para o dono da loja.
+Use os dados reais do ERP quando a pergunta envolver produtos, CMV, DRE, margem, estoque, perdas, lucro, projeção ou vendas.
+Quando a pergunta for conceitual, explique de forma simples e conecte com o sistema.
+Não invente números fora do contexto. Se faltar dado, diga o que falta.
+
+DADOS DO ERP:
+{contexto}
+
+PERGUNTA DO DONO:
+{pergunta}
+"""
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/responses",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": modelo, "input": prompt, "temperature": 0.25, "max_output_tokens": 900},
+                timeout=40,
+            )
+            if resp.status_code >= 400:
+                return None, f"Erro IA {resp.status_code}: {resp.text[:500]}"
+            data = resp.json()
+            texto = data.get("output_text")
+            if not texto:
+                partes = []
+                for item in data.get("output", []):
+                    for c in item.get("content", []):
+                        if c.get("type") in ("output_text", "text"):
+                            partes.append(c.get("text", ""))
+                texto = "\n".join([x for x in partes if x]).strip()
+            return texto, None
+        except Exception as e:
+            return None, f"Erro ao consultar IA real: {e}"
+
+    def responder_consultor(pergunta):
+        pergunta = str(pergunta or "").strip()
+        if not pergunta:
+            return "Digite uma pergunta ou escolha uma pergunta rápida."
+
+        # 1) Primeiro responde conceitos do próprio sistema imediatamente.
+        resp = resposta_base_conhecimento(pergunta)
+        if resp:
+            return resp
+
+        # 2) Depois responde perguntas objetivas usando os dados do ERP.
+        resp = resposta_dados_erp(pergunta)
+        if resp:
+            return resp
+
+        # 3) Se tiver API Key, usa IA real para qualquer pergunta livre.
+        resp_real, erro = consultar_ia_real_openai(pergunta)
+        if resp_real:
+            return "**IA real:**\n\n" + resp_real
+
+        # 4) Sem API Key, entrega uma resposta local útil e avisa claramente.
+        return (
+            "**Resposta local do consultor:**\n\n"
+            f"Com base no painel atual, sua receita é {moeda(receita_periodo)}, o CMV está em {format_pct(cmv_pct_periodo)} e o lucro operacional está em {moeda(dre.get('lucro_operacional', 0))}.\n\n"
+            "Para perguntas totalmente livres, configure a OpenAI API Key em Configurações. Enquanto isso, eu respondo conceitos e análises principais do ERP por inteligência local.\n\n"
+            f"Detalhe técnico: {erro}"
+        )
+
+    # BLOCO ESTÁVEL DA IA
+    # Corrige travamento visual do Streamlit/Edge após várias perguntas seguidas.
+    # Em vez de atualizar HTML dinâmico com unsafe_allow_html, usamos componentes nativos
+    # e forçamos um rerun limpo depois de cada resposta.
+    if "ultima_resposta_ia" not in st.session_state:
+        st.session_state["ultima_pergunta_ia"] = "O que devo fazer hoje?"
+        st.session_state["ultima_resposta_ia"] = responder_consultor("O que devo fazer hoje?")
+
+    col_pergunta_1, col_pergunta_2 = st.columns([1, 1])
+
+    pergunta_modelo = col_pergunta_1.selectbox(
+        "Perguntas rápidas",
+        perguntas_rapidas,
+        key="ia_pergunta_modelo_estavel_v11"
+    )
+
+    pergunta_livre = col_pergunta_2.text_input(
+        "Ou escreva sua pergunta",
+        placeholder="Ex: o que é DRE?",
+        key="ia_pergunta_livre_estavel_v11"
+    )
+
+    usar_livre = bool(str(pergunta_livre or "").strip())
+    pergunta_ia = str(pergunta_livre if usar_livre else pergunta_modelo).strip()
+
+    if st.button("🤖 Gerar resposta da IA", key="btn_gerar_ia_estavel_v11"):
+        with st.spinner("Analisando pergunta e dados do ERP..."):
+            st.session_state["ultima_pergunta_ia"] = pergunta_ia
+            st.session_state["ultima_resposta_ia"] = responder_consultor(pergunta_ia)
+        st.rerun()
+
+    pergunta_exibida = st.session_state.get("ultima_pergunta_ia", pergunta_ia)
+    resposta_exibida = st.session_state.get("ultima_resposta_ia", "")
+
+    with st.container(border=True):
+        st.markdown(f"**Pergunta:** {pergunta_exibida}")
+        st.markdown(resposta_exibida)
+
+    st.markdown("<div class='section-title'>📈 Evolução do período</div>", unsafe_allow_html=True)
+    if not df_periodo.empty:
+        evol = df_periodo.copy()
+        evol["Dia"] = pd.to_datetime(evol["Data"], errors="coerce").dt.date
+        evol = evol.groupby("Dia", as_index=False).agg(Receita=("Receita", "sum"), CMV=("CMV", "sum"))
+        evol["Lucro Bruto"] = evol["Receita"] - evol["CMV"]
+        st.line_chart(evol.set_index("Dia")[["Receita", "CMV", "Lucro Bruto"]])
+    else:
+        st.info("Sem dados para gráfico no período.")
+
+    st.markdown("<div class='section-title'>🏆 Produtos para decisão</div>", unsafe_allow_html=True)
+    if vendas_periodo.empty:
+        st.info("Sem vendas para ranquear produtos.")
+    else:
+        prod = vendas_periodo.groupby("Produto", as_index=False).agg(
+            Receita=("Receita", "sum"),
+            CMV=("CMV", "sum"),
+            Quantidade=("Quantidade", "sum")
+        )
+        prod["Lucro Bruto"] = prod["Receita"] - prod["CMV"]
+        prod["CMV %"] = prod.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+        prod["Margem %"] = prod.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+
+        aba1, aba2, aba3, aba4, aba5 = st.tabs(["Mais vendidos", "Mais lucrativos", "Pior margem", "CMV alto", "Promoção"])
+        cols_prod = ["Produto", "Quantidade", "Receita", "CMV", "CMV %", "Lucro Bruto", "Margem %"]
+        with aba1:
+            st.dataframe(prod.sort_values("Quantidade", ascending=False).head(10)[cols_prod], use_container_width=True, hide_index=True)
+        with aba2:
+            st.dataframe(prod.sort_values("Lucro Bruto", ascending=False).head(10)[cols_prod], use_container_width=True, hide_index=True)
+        with aba3:
+            st.dataframe(prod.sort_values("Margem %", ascending=True).head(10)[cols_prod], use_container_width=True, hide_index=True)
+        with aba4:
+            st.dataframe(prod.sort_values("CMV %", ascending=False).head(10)[cols_prod], use_container_width=True, hide_index=True)
+        with aba5:
+            promo = prod[(prod["CMV %"] <= meta_cmv) & (prod["Lucro Bruto"] > 0)].sort_values("Margem %", ascending=False).head(10)
+            st.caption("Produtos com CMV saudável e margem melhor para ação comercial/promoção controlada.")
+            st.dataframe(promo[cols_prod], use_container_width=True, hide_index=True)
+
+    st.markdown("<div class='section-title'>📊 DRE na palma da mão</div>", unsafe_allow_html=True)
+    dre_mobile = pd.DataFrame([
+        {"Linha": "Receita", "Valor": dre["receita"]},
+        {"Linha": "CMV Total", "Valor": -dre["cmv_total"]},
+        {"Linha": "Lucro Bruto", "Valor": dre["lucro_bruto"]},
+        {"Linha": "Despesas", "Valor": -dre["despesas"]},
+        {"Linha": "Lucro Operacional", "Valor": dre["lucro_operacional"]},
+    ])
+    st.dataframe(
+        dre_mobile,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Valor": st.column_config.NumberColumn(format="R$ %.2f")}
+    )
+
+    st.markdown("<div class='section-title'>📦 Estoque crítico</div>", unsafe_allow_html=True)
+    if estoque_baixo.empty:
+        st.success("Nenhum item crítico no estoque.")
+    else:
+        st.dataframe(estoque_baixo[["Produto", "Qtd Atual", "Estoque Mínimo", "Valor Estoque"]], use_container_width=True, hide_index=True)
 
 
 # =========================================================
@@ -1872,6 +2940,32 @@ elif menu == "Configurações":
         meta_alerta = c2.number_input("Faixa de atenção (%)", min_value=1.0, max_value=90.0, value=get_float_config("meta_cmv_alerta", META_CMV + 4), step=0.5)
         meta_critica = c3.number_input("Faixa crítica (%)", min_value=1.0, max_value=90.0, value=get_float_config("meta_cmv_critica", META_CMV + 8), step=0.5)
 
+        st.markdown("---")
+        st.markdown("### 🔔 Alertas automáticos no WhatsApp")
+        st.caption("Deixe opcional: o dono ativa se quiser receber alertas. Se desmarcar, os alertas continuam apenas no painel.")
+
+        whatsapp_ativo = st.checkbox(
+            "Ativar envio automático de alertas no WhatsApp",
+            value=get_config("whatsapp_ativo", "0") == "1"
+        )
+
+        w1, w2 = st.columns(2)
+        whatsapp_numero = w1.text_input(
+            "Número do responsável",
+            value=get_config("whatsapp_numero", ""),
+            placeholder="Ex: 5521999999999"
+        )
+        whatsapp_horario = w2.text_input(
+            "Horário do resumo diário",
+            value=get_config("whatsapp_horario", "08:00"),
+            placeholder="Ex: 08:00"
+        )
+
+        wa1, wa2, wa3 = st.columns(3)
+        whatsapp_alerta_cmv = wa1.checkbox("Avisar CMV acima da meta", value=get_config("whatsapp_alerta_cmv", "1") == "1")
+        whatsapp_alerta_estoque = wa2.checkbox("Avisar estoque crítico", value=get_config("whatsapp_alerta_estoque", "1") == "1")
+        whatsapp_alerta_dre = wa3.checkbox("Avisar DRE negativo", value=get_config("whatsapp_alerta_dre", "1") == "1")
+
         salvar = st.form_submit_button("Salvar configurações")
 
         if salvar:
@@ -1880,6 +2974,12 @@ elif menu == "Configurações":
             set_config("meta_cmv_ideal", meta_ideal)
             set_config("meta_cmv_alerta", meta_alerta)
             set_config("meta_cmv_critica", meta_critica)
+            set_config("whatsapp_ativo", "1" if whatsapp_ativo else "0")
+            set_config("whatsapp_numero", whatsapp_numero)
+            set_config("whatsapp_horario", whatsapp_horario)
+            set_config("whatsapp_alerta_cmv", "1" if whatsapp_alerta_cmv else "0")
+            set_config("whatsapp_alerta_estoque", "1" if whatsapp_alerta_estoque else "0")
+            set_config("whatsapp_alerta_dre", "1" if whatsapp_alerta_dre else "0")
             st.success("Configurações salvas com sucesso.")
 
     st.info("Exemplo: se sua cafeteria trabalha com CMV ideal de 30%, coloque 30%. O dashboard passa a usar essa meta automaticamente.")
@@ -1888,6 +2988,79 @@ elif menu == "Configurações":
     st.write(f"**Meta CMV ideal:** {format_pct(get_float_config('meta_cmv_ideal', META_CMV))}")
     st.write(f"**Atenção:** {format_pct(get_float_config('meta_cmv_alerta', META_CMV + 4))}")
     st.write(f"**Crítico:** {format_pct(get_float_config('meta_cmv_critica', META_CMV + 8))}")
+
+    st.markdown("### 🔔 WhatsApp automático")
+    whatsapp_ativo_atual = get_config("whatsapp_ativo", "0") == "1"
+    numero_atual = get_config("whatsapp_numero", "")
+    horario_atual = get_config("whatsapp_horario", "08:00")
+
+    if whatsapp_ativo_atual:
+        st.success(f"WhatsApp automático ATIVADO para {numero_atual or 'número não informado'} às {horario_atual}.")
+    else:
+        st.warning("WhatsApp automático DESATIVADO. Os alertas aparecem somente no painel.")
+
+    hoje_cfg = date.today()
+    inicio_cfg, fim_cfg = datas_periodo("Este mês")
+    dre_cfg = dre_periodo(inicio_cfg, fim_cfg)
+    estoque_baixo_cfg = estoque_df()
+    estoque_baixo_cfg = estoque_baixo_cfg[estoque_baixo_cfg["Qtd Atual"] <= estoque_baixo_cfg["Estoque Mínimo"]]
+    cmv_cfg = dre_cfg["cmv_pct"]
+    meta_cfg = get_float_config("meta_cmv_ideal", META_CMV)
+
+    inteligencia_cfg = gerar_alertas_inteligentes_erp(inicio_cfg, fim_cfg)
+    previa_whatsapp = inteligencia_cfg["mensagem_whatsapp"]
+
+    st.text_area("Prévia da mensagem inteligente de WhatsApp", value=previa_whatsapp, height=360)
+
+    st.markdown("#### Integração Z-API")
+    zapi_client_token_atual = get_config("zapi_client_token", "")
+    with st.expander("Configuração avançada da Z-API", expanded=False):
+        novo_client_token = st.text_input(
+            "Client-Token da Z-API (se sua conta exigir)",
+            value=zapi_client_token_atual,
+            type="password",
+            help="Algumas contas da Z-API exigem Client-Token no cabeçalho. Se não tiver, deixe em branco."
+        )
+        if st.button("Salvar Client-Token"):
+            set_config("zapi_client_token", novo_client_token.strip())
+            st.success("Client-Token salvo.")
+
+    st.markdown("#### 🤖 IA Consultora Real")
+    with st.expander("Configuração da OpenAI", expanded=False):
+        openai_key_atual = get_config("openai_api_key", "")
+        openai_model_atual = get_config("openai_model", "gpt-4.1-mini")
+        nova_openai_key = st.text_input(
+            "OpenAI API Key",
+            value=openai_key_atual,
+            type="password",
+            help="Chave usada para a IA responder perguntas livres com base nos dados do ERP."
+        )
+        novo_openai_model = st.text_input(
+            "Modelo da IA",
+            value=openai_model_atual,
+            help="Exemplo: gpt-4.1-mini. Se sua conta tiver outro modelo liberado, você pode alterar aqui."
+        )
+        if st.button("Salvar configuração da IA"):
+            set_config("openai_api_key", nova_openai_key.strip())
+            set_config("openai_model", novo_openai_model.strip())
+            st.success("Configuração da IA salva.")
+
+    if get_config("openai_api_key", "").strip():
+        st.success("IA real ATIVADA. O Consultor IA responderá perguntas livres usando os dados do ERP.")
+    else:
+        st.warning("IA real ainda não configurada. O Consultor IA continuará usando o motor local por regras.")
+
+    if st.button("Enviar teste real no WhatsApp"):
+        if not whatsapp_ativo_atual:
+            st.warning("Ative o WhatsApp automático antes de enviar teste.")
+        elif not numero_atual:
+            st.warning("Informe o número do responsável nas configurações.")
+        else:
+            ok, msg = enviar_whatsapp_zapi(numero_atual, previa_whatsapp)
+            if ok:
+                st.success("WhatsApp enviado com sucesso.")
+            else:
+                st.error(msg)
 
 
 # =========================================================
