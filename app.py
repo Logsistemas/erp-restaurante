@@ -4,11 +4,14 @@ from pathlib import Path
 from datetime import date
 import xml.etree.ElementTree as ET
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from PIL import Image
 import re
 import json
 import requests
+import plotly.express as px
+import plotly.graph_objects as go
 
 DB_PATH = Path("estoque_restaurante.db")
 META_CMV = 36.0
@@ -1661,8 +1664,79 @@ if menu == "Painel CMV":
             )
             diario_resumo["CMV %"] = diario_resumo.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
 
-            st.line_chart(diario_resumo.set_index("Dia")[["Receita", "CMV"]])
-            st.caption("Evolução de receita e CMV em R$.")
+            fig = px.area(
+                diario_resumo,
+                x="Dia",
+                y=["Receita", "CMV"],
+                template="plotly_white",
+                color_discrete_map={
+                    "Receita": "#2563eb",
+                    "CMV": "#ef4444"
+                }
+            )
+
+            fig.update_layout(
+                height=420,
+                hovermode="x unified",
+                legend_title="",
+                margin=dict(l=10, r=10, t=30, b=10),
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                font=dict(
+                    family="Segoe UI",
+                    size=13,
+                    color="#0f172a"
+                )
+            )
+
+            fig.update_traces(
+                line=dict(width=4),
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.caption("Evolução diária de Receita e CMV.")
+
+            gauge_color = "#16a34a"
+
+            if cmv_pct_periodo > meta_cmv_input:
+                gauge_color = "#dc2626"
+            elif cmv_pct_periodo > (meta_cmv_input * 0.9):
+                gauge_color = "#f59e0b"
+
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=cmv_pct_periodo,
+                number={'suffix': "%"},
+                title={'text': "CMV Atual"},
+                gauge={
+                    'axis': {'range': [0, 100]},
+                    'bar': {'color': gauge_color},
+                    'steps': [
+                        {'range': [0, meta_cmv_input * 0.9], 'color': "#dcfce7"},
+                        {'range': [meta_cmv_input * 0.9, meta_cmv_input], 'color': "#fef3c7"},
+                        {'range': [meta_cmv_input, 100], 'color': "#fee2e2"}
+                    ],
+                    'threshold': {
+                        'line': {'color': "#111827", 'width': 4},
+                        'thickness': 0.75,
+                        'value': meta_cmv_input
+                    }
+                }
+            ))
+
+            fig_gauge.update_layout(
+                height=320,
+                margin=dict(l=20, r=20, t=60, b=20),
+                paper_bgcolor="white",
+                font=dict(
+                    family="Segoe UI",
+                    size=14,
+                    color="#0f172a"
+                )
+            )
+
+            st.plotly_chart(fig_gauge, use_container_width=True)
 
             st.markdown("### Top produtos por resultado")
 
