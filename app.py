@@ -1768,13 +1768,14 @@ if menu == "Painel CMV":
                         "Quantidade",
                         ascending=False
                     ).head(10)
+                    top_vendidos["Quantidade Label"] = top_vendidos["Quantidade"].apply(lambda x: f"{float(x):,.0f}".replace(",", "."))
 
                     fig_vendidos = px.bar(
                         top_vendidos,
                         x="Quantidade",
                         y="Produto",
                         orientation="h",
-                        text="Quantidade",
+                        text="Quantidade Label",
                         color="Quantidade",
                         color_continuous_scale=["#dbeafe", "#60a5fa", "#2563eb", "#1e3a8a"]
                     )
@@ -1877,7 +1878,21 @@ if menu == "Painel CMV":
         base["CMV %"] = base.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
         base["Lucro Bruto"] = base["Receita"] - base["CMV"]
         base["Margem %"] = base.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
-        st.dataframe(base, use_container_width=True, hide_index=True)
+        st.dataframe(
+    base.style
+    .format({
+        "Receita": "R$ {:,.2f}",
+        "CMV": "R$ {:,.2f}",
+        "Lucro Bruto": "R$ {:,.2f}",
+        "CMV %": "{:.2f}%",
+        "Margem %": "{:.2f}%"
+    })
+    .background_gradient(subset=["Lucro Bruto"], cmap="Greens")
+    .background_gradient(subset=["CMV %"], cmap="Reds")
+    .background_gradient(subset=["Margem %"], cmap="Greens"),
+    use_container_width=True,
+    hide_index=True
+)
 
 
 
@@ -1991,6 +2006,20 @@ elif menu == "📱 Executivo Mobile":
     df_hoje = resumo_periodo(inicio_hoje, fim_amanha)
     est = estoque_df()
     dre = dre_periodo(inicio_periodo, fim_periodo)
+    lucro_liquido = dre["lucro_operacional"]
+
+    margem_operacional = (
+    (lucro_liquido / dre["receita"]) * 100
+    if dre["receita"] else 0
+    )
+    despesas_operacionais = dre["perdas"] + dre["despesas"]
+
+    lucro_liquido = dre["lucro_bruto"] - despesas_operacionais
+
+    margem_operacional = (
+    (lucro_liquido / dre["receita"]) * 100
+    if dre["receita"] else 0
+    )
 
     receita_periodo = df_periodo.loc[df_periodo["TipoSaida"] == "Venda", "Receita"].sum() if not df_periodo.empty else 0
     cmv_periodo = df_periodo["CMV"].sum() if not df_periodo.empty else 0
@@ -2126,8 +2155,12 @@ elif menu == "📱 Executivo Mobile":
     with c5:
         kpi("Ticket médio", moeda(ticket_medio), "Receita ÷ quantidade vendida", "purple")
     with c6:
-        kpi("Estoque", moeda(estoque_valor), f"{len(estoque_baixo)} produto(s) críticos", "orange" if len(estoque_baixo) else "green")
-
+       metric_card(
+        "Lucro Líquido",
+        moeda(lucro_liquido),
+        format_pct(margem_operacional),
+        "good" if lucro_liquido > 0 else "bad"
+    )
     st.markdown("<div class='section-title'>⏱ Hoje</div>", unsafe_allow_html=True)
     h1, h2 = st.columns(2)
     with h1:
@@ -2799,10 +2832,16 @@ elif menu == "DRE Gerencial":
     label = periodo_label(inicio_periodo, fim_periodo)
 
     dre = dre_periodo(inicio_periodo, fim_periodo)
+    lucro_liquido = dre["lucro_operacional"]
+
+    margem_operacional = (
+    (lucro_liquido / dre["receita"]) * 100
+    if dre["receita"] else 0
+    )
 
     st.markdown(f"### Resultado do período • {label}")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
 
     with c1:
         metric_card("Receita", moeda(dre["receita"]), "Vendas lançadas", "blue")
@@ -2814,7 +2853,13 @@ elif menu == "DRE Gerencial":
         metric_card("Despesas", moeda(dre["despesas"]), "Despesas lançadas", "warn" if dre["despesas"] > 0 else "good")
     with c5:
         metric_card("Lucro Operacional", moeda(dre["lucro_operacional"]), format_pct(dre["margem_operacional_pct"]), "good" if dre["lucro_operacional"] >= 0 else "bad")
-
+    with c6:
+       metric_card(
+        "Lucro Líquido",
+        moeda(lucro_liquido),
+        format_pct(margem_operacional),
+        "good" if lucro_liquido > 0 else "bad"
+    )
     st.markdown("### Estrutura da DRE")
 
     dre_linhas = pd.DataFrame([
