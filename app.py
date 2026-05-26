@@ -1801,13 +1801,14 @@ if menu == "Painel CMV":
                         "Lucro Bruto",
                         ascending=False
                     ).head(10)
+                    top_lucro["Lucro Label"] = top_lucro["Lucro Bruto"].apply(moeda)
 
                     fig_lucro = px.bar(
                         top_lucro,
                         x="Lucro Bruto",
                         y="Produto",
                         orientation="h",
-                        text="Lucro Bruto",
+                        text="Lucro Label",
                         color="Lucro Bruto",
                         color_continuous_scale=["#dcfce7", "#4ade80", "#16a34a", "#14532d"]
                     )
