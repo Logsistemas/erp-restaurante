@@ -1741,6 +1741,7 @@ if menu == "Painel CMV":
             st.markdown("### Top produtos por resultado")
 
             vendas = df_periodo[df_periodo["TipoSaida"] == "Venda"].copy()
+
             if vendas.empty:
                 st.info("Ainda não há vendas no período.")
             else:
@@ -1749,17 +1750,81 @@ if menu == "Painel CMV":
                     CMV=("CMV", "sum"),
                     Quantidade=("Quantidade", "sum")
                 )
+
                 prod["Lucro Bruto"] = prod["Receita"] - prod["CMV"]
-                prod["CMV %"] = prod.apply(lambda r: (r["CMV"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
-                prod["Margem %"] = prod.apply(lambda r: (r["Lucro Bruto"] / r["Receita"] * 100) if r["Receita"] else 0, axis=1)
+                prod["CMV %"] = prod.apply(
+                    lambda r: (r["CMV"] / r["Receita"] * 100)
+                    if r["Receita"] else 0,
+                    axis=1
+                )
 
                 col_a, col_b = st.columns(2)
+
                 with col_a:
-                    st.markdown("**🏆 Mais vendidos**")
-                    st.dataframe(prod.sort_values("Quantidade", ascending=False).head(10), use_container_width=True, hide_index=True)
+
+                    st.markdown("#### 🏆 Mais vendidos")
+
+                    top_vendidos = prod.sort_values(
+                        "Quantidade",
+                        ascending=False
+                    ).head(10)
+
+                    fig_vendidos = px.bar(
+                        top_vendidos,
+                        x="Quantidade",
+                        y="Produto",
+                        orientation="h",
+                        text="Quantidade",
+                        color="Quantidade",
+                        color_continuous_scale=["#dbeafe", "#60a5fa", "#2563eb", "#1e3a8a"]
+                    )
+
+                    fig_vendidos.update_layout(
+                        height=420,
+                        yaxis={'categoryorder':'total ascending'},
+                        paper_bgcolor="white",
+                        plot_bgcolor="white",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        coloraxis_showscale=False
+                    )
+
+                    st.plotly_chart(
+                        fig_vendidos,
+                        use_container_width=True
+                    )
+
                 with col_b:
-                    st.markdown("**💎 Mais lucrativos**")
-                    st.dataframe(prod.sort_values("Lucro Bruto", ascending=False).head(10), use_container_width=True, hide_index=True)
+
+                    st.markdown("#### 💎 Mais lucrativos")
+
+                    top_lucro = prod.sort_values(
+                        "Lucro Bruto",
+                        ascending=False
+                    ).head(10)
+
+                    fig_lucro = px.bar(
+                        top_lucro,
+                        x="Lucro Bruto",
+                        y="Produto",
+                        orientation="h",
+                        text="Lucro Bruto",
+                        color="Lucro Bruto",
+                        color_continuous_scale=["#dcfce7", "#4ade80", "#16a34a", "#14532d"]
+                    )
+
+                    fig_lucro.update_layout(
+                        height=420,
+                        yaxis={'categoryorder':'total ascending'},
+                        paper_bgcolor="white",
+                        plot_bgcolor="white",
+                        margin=dict(l=10, r=10, t=30, b=10),
+                        coloraxis_showscale=False
+                    )
+
+                    st.plotly_chart(
+                        fig_lucro,
+                        use_container_width=True
+                    )
 
     with right:
         st.markdown("### Alertas inteligentes")
