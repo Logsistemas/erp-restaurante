@@ -206,7 +206,8 @@ def init_db():
             categoria TEXT NOT NULL,
             descricao TEXT,
             valor REAL NOT NULL,
-            observacao TEXT
+            observacao TEXT,
+            status TEXT DEFAULT 'Em aberto'
         )
     """)
 
@@ -219,6 +220,11 @@ def init_db():
         cur.execute("ALTER TABLE movimentacoes ADD COLUMN tipo_saida TEXT DEFAULT ''")
     if "motivo_saida" not in cols:
         cur.execute("ALTER TABLE movimentacoes ADD COLUMN motivo_saida TEXT DEFAULT ''")
+    cur.execute("PRAGMA table_info(despesas)")
+    cols_despesas = [r[1] for r in cur.fetchall()]
+
+    if "status" not in cols_despesas:
+        cur.execute("ALTER TABLE despesas ADD COLUMN status TEXT DEFAULT 'Em aberto'")
 
     c.commit()
     c.close()
@@ -1295,6 +1301,32 @@ def inserir_despesa(data_mov, categoria, descricao, valor, observacao=""):
     c.close()
 
 
+def inserir_despesa(data_mov, categoria, descricao, valor, observacao=""):
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+        INSERT INTO despesas (data, categoria, descricao, valor, observacao)
+        VALUES (?, ?, ?, ?, ?)
+    """, (str(data_mov), categoria, descricao, float(valor), observacao))
+
+    c.commit()
+    c.close()
+
+
+def excluir_despesa(id_despesa):
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute(
+        "DELETE FROM despesas WHERE id = ?",
+        (int(id_despesa),)
+    )
+
+    c.commit()
+    c.close()
+
+
 def dre_periodo(inicio, fim):
     df = resumo_periodo(inicio, fim)
     despesas = despesas_df(inicio, fim)
@@ -1412,6 +1444,7 @@ def menus_por_perfil():
         "📱 Executivo Mobile",
         "Precificação",
         "DRE Gerencial",
+        "Contas a Pagar",
         "Curva ABC",
         "Produtos",
         "Configurações",
@@ -1438,6 +1471,7 @@ def menus_por_perfil():
             "📱 Executivo Mobile",
             "Precificação",
             "DRE Gerencial",
+            "Contas a Pagar",
             "Curva ABC",
             "Estoque Atual",
             "Movimentações",
@@ -2804,7 +2838,63 @@ elif menu == "Precificação":
 # =========================================================
 # DRE GERENCIAL
 # =========================================================
+elif menu == "Contas a Pagar":
+
+    st.subheader("💰 Contas a Pagar")
+    st.caption("Gestão financeira operacional.")
+    
+
+    c = conn()
+    despesas = pd.read_sql_query("""
+        SELECT
+            id,
+            data,
+            categoria,
+            descricao,
+            valor,
+            observacao,
+            COALESCE(status, 'Em aberto') AS status
+        FROM despesas
+        ORDER BY date(data) DESC, id DESC
+    """, c)
+    c.close()
+
+    st.markdown("### 📋 Lançamentos")
+
+    if despesas.empty:
+        st.info("Nenhuma despesa cadastrada.")
+    else:
+
+        for _, row in despesas.iterrows():
+
+            c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1,2,2,2,1,2,1,1])
+
+            c1.write(row["id"])
+            c2.write(row["data"])
+            c3.write(row["categoria"])
+            c4.write(row["descricao"])
+            c5.write(f'R$ {row["valor"]:,.2f}')
+            c6.write(row["observacao"])
+            status = row["status"] if "status" in row else "Em aberto"
+
+            if status == "Pago":
+                c7.success("Pago")
+            else:
+                c7.warning("Em aberto")
+
+            if status != "Pago":
+                if c8.button("✅", key=f"pg_{row['id']}"):
+                    atualizar_status_despesa(row["id"], "Pago")
+                    st.rerun()
+
+            if c8.button("🗑", key=f"del_{row['id']}"):
+                excluir_despesa(row["id"])
+                st.success("Despesa excluída com sucesso.")
+                st.rerun()
+
+
 elif menu == "DRE Gerencial":
+
     st.subheader("DRE Gerencial")
     st.caption("Visão financeira simplificada: receita, CMV, perdas, despesas e lucro operacional.")
 
@@ -2912,7 +3002,32 @@ elif menu == "DRE Gerencial":
             st.info("Nenhuma despesa lançada no período.")
         else:
             desp_cat = despesas_periodo.groupby("Categoria", as_index=False)["Valor"].sum().sort_values("Valor", ascending=False)
-            st.bar_chart(desp_cat.set_index("Categoria"))
+
+            fig_desp = px.bar(
+                desp_cat,
+                x="Categoria",
+                y="Valor",
+                text="Valor",
+                color="Valor",
+                color_continuous_scale=["#dbeafe", "#60a5fa", "#2563eb", "#1e3a8a"]
+            )
+
+            fig_desp.update_layout(
+                height=420,
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                margin=dict(l=10, r=10, t=30, b=10),
+                coloraxis_showscale=False
+            )
+
+            fig_desp.update_traces(
+                texttemplate="R$ %{y:,.2f}",
+                textposition="outside",
+                marker_line_width=0
+            )
+
+            st.plotly_chart(fig_desp, use_container_width=True)
+
             st.dataframe(
                 desp_cat,
                 use_container_width=True,
