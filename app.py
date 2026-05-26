@@ -283,6 +283,9 @@ def get_or_create(nome, categoria="Mercadoria", unidade="UN"):
 def moeda(v):
     return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
+def format_pct(v):
+    return f"{float(v):,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+
 
 def estoque_produto(pid):
     c = conn()
@@ -792,6 +795,31 @@ def periodo_label(inicio, fim):
     return f"{pd.Timestamp(inicio).date().strftime('%d/%m/%Y')} até {fim_visivel.strftime('%d/%m/%Y')}"
 
 
+def resumo_periodo(inicio, fim):
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT
+            m.data Data,
+            p.nome Produto,
+            p.categoria Categoria,
+            COALESCE(NULLIF(m.tipo_saida,''),'Venda') TipoSaida,
+            m.quantidade Quantidade,
+            m.receita_venda Receita,
+            m.cmv_peps CMV
+        FROM movimentacoes m
+        JOIN produtos p ON p.id=m.produto_id
+        WHERE m.tipo='Saída'
+          AND date(m.data)>=date(?)
+          AND date(m.data)<date(?)
+    """, c, params=(inicio, fim))
+    c.close()
+
+    if df.empty:
+        return df
+
+    df["Data"] = pd.to_datetime(df["Data"])
+    return df
+
 
 
 # =========================================================
@@ -1083,7 +1111,7 @@ def enviar_whatsapp_zapi(numero, mensagem):
 # =========================================================
 # DASHBOARD PREMIUM
 # =========================================================
-def metric_card(label, value, help_text="", tone="default"):
+def metric_card(label, value, help_text="", tone="default", icon="📊"):
     colors = {
         "default": "#0f172a",
         "good": "#166534",
@@ -1092,91 +1120,67 @@ def metric_card(label, value, help_text="", tone="default"):
         "blue": "#1d4ed8",
         "purple": "#6d28d9",
     }
-    color = colors.get(tone, colors["default"])
-    st.markdown(
-        f"""
-        <div style="
-            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-            border: 1px solid #e5e7eb;
-            border-left: 5px solid {color};
-            border-radius: 18px;
-            padding: 18px 18px;
-            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
-            min-height: 122px;">
-            <div style="font-size: 13px; color: #64748b; font-weight: 600; margin-bottom: 8px;">
-                {label}
-            </div>
-            <div style="font-size: 27px; color: #0f172a; font-weight: 800; line-height: 1.1;">
-                {value}
-            </div>
-            <div style="font-size: 12px; color: #64748b; margin-top: 8px;">
-                {help_text}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
 
-
-def resumo_periodo(inicio, fim):
-    c = conn()
-    df = pd.read_sql_query("""
-        SELECT
-            m.data Data,
-            p.nome Produto,
-            p.categoria Categoria,
-            COALESCE(NULLIF(m.tipo_saida,''),'Venda') TipoSaida,
-            m.quantidade Quantidade,
-            m.receita_venda Receita,
-            m.cmv_peps CMV
-        FROM movimentacoes m
-        JOIN produtos p ON p.id=m.produto_id
-        WHERE m.tipo='Saída'
-          AND date(m.data)>=date(?)
-          AND date(m.data)<date(?)
-    """, c, params=(inicio, fim))
-    c.close()
-
-    if df.empty:
-        return df
-
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
-    df["Receita"] = pd.to_numeric(df["Receita"], errors="coerce").fillna(0)
-    df["CMV"] = pd.to_numeric(df["CMV"], errors="coerce").fillna(0)
-    df["Quantidade"] = pd.to_numeric(df["Quantidade"], errors="coerce").fillna(0)
-    return df
-
-
-def format_pct(v):
-    return f"{float(v):.2f}%".replace(".", ",")
-
-
-def alerta_box(texto, tipo="warn"):
-    cores = {
-        "warn": ("#fffbeb", "#f59e0b", "#92400e"),
-        "bad": ("#fef2f2", "#ef4444", "#991b1b"),
-        "good": ("#f0fdf4", "#22c55e", "#166534"),
-        "info": ("#eff6ff", "#3b82f6", "#1d4ed8"),
+    bg_colors = {
+        "default": "#f8fafc",
+        "good": "#f0fdf4",
+        "warn": "#fffbeb",
+        "bad": "#fef2f2",
+        "blue": "#eff6ff",
+        "purple": "#faf5ff",
     }
-    bg, border, color = cores.get(tipo, cores["warn"])
+
+    color = colors.get(tone, colors["default"])
+    bg = bg_colors.get(tone, bg_colors["default"])
+
+    html = f"""
+<div style="background:linear-gradient(180deg,#ffffff 0%,{bg} 100%);border:1px solid #e5e7eb;border-left:5px solid {color};border-radius:18px;padding:22px 24px;box-shadow:0 8px 22px rgba(15,23,42,0.06);min-height:155px;">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+<div style="font-size:13px;color:#64748b;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">{label}</div>
+<div style="width:34px;height:34px;border-radius:12px;background:{bg};color:{color};display:flex;align-items:center;justify-content:center;font-size:18px;">{icon}</div>
+</div>
+<div style="font-size:34px;color:#0f172a;font-weight:850;line-height:1.1;margin-top:6px;">{value}</div>
+<div style="font-size:12px;color:#64748b;margin-top:10px;font-weight:500;">{help_text}</div>
+</div>
+"""
+
+    st.markdown(html, unsafe_allow_html=True)
+
+def alerta_box(texto, tone="default"):
+    colors = {
+        "default": "#334155",
+        "good": "#166534",
+        "warn": "#92400e",
+        "bad": "#991b1b",
+    }
+
+    bg_colors = {
+        "default": "#f8fafc",
+        "good": "#f0fdf4",
+        "warn": "#fffbeb",
+        "bad": "#fef2f2",
+    }
+
+    color = colors.get(tone, colors["default"])
+    bg = bg_colors.get(tone, bg_colors["default"])
+
     st.markdown(
         f"""
-        <div style="
-            background:{bg};
-            border-left:5px solid {border};
-            color:{color};
-            padding:12px 14px;
-            border-radius:12px;
-            margin-bottom:8px;
-            font-size:14px;
-            font-weight:600;">
-            {texto}
-        </div>
-        """,
+<div style="
+background:{bg};
+border-left:5px solid {color};
+padding:14px 18px;
+border-radius:12px;
+margin-bottom:10px;
+font-weight:600;
+color:{color};
+box-shadow:0 4px 12px rgba(0,0,0,0.04);
+">
+{texto}
+</div>
+""",
         unsafe_allow_html=True
     )
-
-
 # =========================================================
 # PRECIFICAÇÃO
 # =========================================================
