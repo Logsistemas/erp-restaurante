@@ -1,5 +1,8 @@
 
 import sqlite3
+import secrets
+import uuid
+import unicodedata
 from pathlib import Path
 from datetime import date
 import xml.etree.ElementTree as ET
@@ -226,8 +229,144 @@ def init_db():
     if "status" not in cols_despesas:
         cur.execute("ALTER TABLE despesas ADD COLUMN status TEXT DEFAULT 'Em aberto'")
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessoes_auth (
+            token TEXT PRIMARY KEY,
+            usuario TEXT NOT NULL,
+            criado_em TEXT NOT NULL,
+            expira_em TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("PRAGMA table_info(produtos)")
+    cols_prod = [r[1] for r in cur.fetchall()]
+
+    if "codigo" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN codigo TEXT")
+    if "codigo_barras" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN codigo_barras TEXT")
+    if "custo_referencia" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN custo_referencia REAL DEFAULT 0")
+    if "ncm" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN ncm TEXT DEFAULT ''")
+    if "cst" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN cst TEXT DEFAULT ''")
+    if "icms" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN icms REAL DEFAULT 0")
+    if "pis" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN pis REAL DEFAULT 0")
+    if "cofins" not in cols_prod:
+        cur.execute("ALTER TABLE produtos ADD COLUMN cofins REAL DEFAULT 0")
+
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_produtos_codigo
+        ON produtos(codigo)
+        WHERE codigo IS NOT NULL AND TRIM(codigo) != ''
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_produtos_codigo_barras
+        ON produtos(codigo_barras)
+        WHERE codigo_barras IS NOT NULL AND TRIM(codigo_barras) != ''
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdv_vendas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT NOT NULL,
+            hora TEXT,
+            operador TEXT,
+            subtotal REAL NOT NULL,
+            desconto REAL DEFAULT 0,
+            total REAL NOT NULL,
+            troco REAL DEFAULT 0,
+            status TEXT DEFAULT 'FINALIZADA',
+            nfce_status TEXT DEFAULT 'PENDENTE',
+            nfce_chave TEXT,
+            nfce_numero TEXT,
+            nfce_serie TEXT,
+            observacao TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdv_venda_itens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venda_id INTEGER NOT NULL,
+            produto_id INTEGER NOT NULL,
+            codigo TEXT,
+            nome TEXT,
+            unidade TEXT,
+            quantidade REAL NOT NULL,
+            preco_unitario REAL NOT NULL,
+            subtotal REAL NOT NULL,
+            ncm TEXT,
+            cst TEXT,
+            icms REAL DEFAULT 0,
+            pis REAL DEFAULT 0,
+            cofins REAL DEFAULT 0,
+            cmv_peps REAL DEFAULT 0,
+            movimentacao_id INTEGER
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdv_venda_pagamentos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venda_id INTEGER NOT NULL,
+            forma TEXT NOT NULL,
+            valor REAL NOT NULL,
+            troco REAL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pdv_caixas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operador_abertura TEXT NOT NULL,
+            operador_fechamento TEXT,
+            data_abertura TEXT NOT NULL,
+            hora_abertura TEXT NOT NULL,
+            data_fechamento TEXT,
+            hora_fechamento TEXT,
+            valor_inicial REAL NOT NULL DEFAULT 0,
+            valor_contado REAL,
+            status TEXT NOT NULL DEFAULT 'ABERTO',
+            observacao_abertura TEXT,
+            observacao_fechamento TEXT,
+            total_vendido REAL DEFAULT 0,
+            total_descontos REAL DEFAULT 0,
+            total_dinheiro REAL DEFAULT 0,
+            total_pix REAL DEFAULT 0,
+            total_credito REAL DEFAULT 0,
+            total_debito REAL DEFAULT 0,
+            qtd_vendas INTEGER DEFAULT 0,
+            qtd_cancelamentos INTEGER DEFAULT 0,
+            valor_esperado_dinheiro REAL DEFAULT 0,
+            diferenca_dinheiro REAL DEFAULT 0,
+            nfce_pendencias INTEGER DEFAULT 0
+        )
+    """)
+
+    cur.execute("PRAGMA table_info(pdv_vendas)")
+    cols_pdv_vendas = [r[1] for r in cur.fetchall()]
+    if "caixa_id" not in cols_pdv_vendas:
+        cur.execute("ALTER TABLE pdv_vendas ADD COLUMN caixa_id INTEGER")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pdv_vendas_caixa ON pdv_vendas(caixa_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pdv_vendas_data ON pdv_vendas(data)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pdv_vendas_status ON pdv_vendas(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pdv_caixas_status ON pdv_caixas(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pdv_venda_pagamentos_venda ON pdv_venda_pagamentos(venda_id)")
+
+    cur.execute("PRAGMA table_info(movimentacoes)")
+    cols_mov = [r[1] for r in cur.fetchall()]
+    if "pdv_venda_id" not in cols_mov:
+        cur.execute("ALTER TABLE movimentacoes ADD COLUMN pdv_venda_id INTEGER")
+
     c.commit()
     c.close()
+
+    migrar_catalogo_produtos()
 
 
 def seed():
@@ -257,6 +396,131 @@ def seed():
     c.close()
 
 
+def normalizar_codigo_produto(codigo):
+    return str(codigo or "").strip().upper()
+
+
+def normalizar_texto_ascii(texto):
+    texto = str(texto or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    return "".join(ch for ch in texto if not unicodedata.combining(ch))
+
+
+MAPA_PREFIXO_CATEGORIA = {
+    "croissant": "CRO",
+    "pastel": "PAS",
+    "acai": "ACA",
+    "açaí": "ACA",
+    "torta": "TOR",
+    "bebida": "BEB",
+    "bebidas": "BEB",
+    "cafe": "BEB",
+    "café": "BEB",
+    "suco": "BEB",
+    "sucos": "BEB",
+    "insumo": "INS",
+    "insumos": "INS",
+    "embalagem": "INS",
+    "embalagens": "INS",
+    "mercadoria": "PRD",
+}
+
+
+def gerar_prefixo_sku(categoria, nome=""):
+    cat_norm = normalizar_texto_ascii(categoria)
+    nome_u = normalizar_codigo_produto(nome)
+
+    if cat_norm in MAPA_PREFIXO_CATEGORIA:
+        prefixo = MAPA_PREFIXO_CATEGORIA[cat_norm]
+        if prefixo != "PRD":
+            return prefixo
+
+    if "CROISSANT" in nome_u:
+        return "CRO"
+    if "PASTEL" in nome_u:
+        return "PAS"
+    if "ACAI" in nome_u or "AÇAI" in nome_u or nome_u.startswith("ACA "):
+        return "ACA"
+    if "TORTA" in nome_u:
+        return "TOR"
+
+    return "PRD"
+
+
+def codigo_sku_legado(codigo):
+    cod = normalizar_codigo_produto(codigo)
+    return (not cod) or cod.startswith("SKU-")
+
+
+def max_sequencial_prefixo(prefixo, cur):
+    cur.execute("""
+        SELECT codigo
+        FROM produtos
+        WHERE codigo IS NOT NULL AND TRIM(codigo) != ''
+    """)
+    max_num = 0
+    prefixo = normalizar_codigo_produto(prefixo)
+    marcador = f"{prefixo}-"
+
+    for row in cur.fetchall():
+        cod = normalizar_codigo_produto(row["codigo"])
+        if not cod.startswith(marcador):
+            continue
+        sufixo = cod[len(marcador):]
+        if sufixo.isdigit():
+            max_num = max(max_num, int(sufixo))
+
+    return max_num
+
+
+def gerar_proximo_codigo_sku(categoria, nome, cur):
+    prefixo = gerar_prefixo_sku(categoria, nome)
+    seq = max_sequencial_prefixo(prefixo, cur) + 1
+    return f"{prefixo}-{seq:03d}"
+
+
+def gerar_codigo_produto_automatico(produto_id, nome="", categoria=""):
+    """Compatibilidade: gera SKU categorizado."""
+    c = conn()
+    cur = c.cursor()
+    codigo = gerar_proximo_codigo_sku(categoria, nome, cur)
+    c.close()
+    return codigo
+
+
+def organizar_skus_produtos():
+    """Organiza SKU no padrão PREFIXO-NNN (CRO-001, PAS-001, ACA-001, PRD-001)."""
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT id, nome, categoria, codigo
+        FROM produtos
+        ORDER BY id
+    """)
+    produtos = cur.fetchall()
+    contadores = {}
+
+    for row in produtos:
+        if not codigo_sku_legado(row["codigo"]):
+            continue
+
+        prefixo = gerar_prefixo_sku(row["categoria"], row["nome"])
+        if prefixo not in contadores:
+            contadores[prefixo] = max_sequencial_prefixo(prefixo, cur)
+
+        contadores[prefixo] += 1
+        codigo = f"{prefixo}-{contadores[prefixo]:03d}"
+        cur.execute("UPDATE produtos SET codigo = ? WHERE id = ?", (codigo, row["id"]))
+
+    c.commit()
+    c.close()
+
+
+def migrar_catalogo_produtos():
+    """Preenche SKU ausente ou legado SKU-00000."""
+    organizar_skus_produtos()
+
+
 # =========================================================
 # FUNÇÕES BASE
 # =========================================================
@@ -265,6 +529,950 @@ def produtos_df():
     df = pd.read_sql_query("SELECT * FROM produtos WHERE ativo=1 ORDER BY nome", c)
     c.close()
     return df
+
+
+def produtos_catalogo_df():
+    """
+    Catálogo profissional unificado para operação, estoque e CMV.
+    Custo exibido: PEPS (lotes) quando existir; senão custo_referencia do cadastro.
+    Estoque: saldo atual consolidado dos lotes.
+    """
+    c = conn()
+    df = pd.read_sql_query("""
+        SELECT
+            p.id,
+            p.codigo,
+            p.codigo_barras,
+            p.nome,
+            p.categoria,
+            p.unidade,
+            p.custo_referencia,
+            p.preco_venda,
+            p.estoque_minimo,
+            p.ncm,
+            p.cst,
+            p.icms,
+            p.pis,
+            p.cofins,
+            COALESCE(SUM(l.qtd_restante), 0) AS estoque_qtd,
+            COALESCE(SUM(l.qtd_restante * l.valor_unitario), 0) AS estoque_valor
+        FROM produtos p
+        LEFT JOIN lotes l ON l.produto_id = p.id AND l.qtd_restante > 0
+        WHERE p.ativo = 1
+        GROUP BY p.id
+        ORDER BY p.codigo, p.nome
+    """, c)
+    c.close()
+
+    if df.empty:
+        return df
+
+    df["estoque_qtd"] = pd.to_numeric(df["estoque_qtd"], errors="coerce").fillna(0)
+    df["estoque_valor"] = pd.to_numeric(df["estoque_valor"], errors="coerce").fillna(0)
+    df["custo_referencia"] = pd.to_numeric(df["custo_referencia"], errors="coerce").fillna(0)
+    df["preco_venda"] = pd.to_numeric(df["preco_venda"], errors="coerce").fillna(0)
+    df["icms"] = pd.to_numeric(df["icms"], errors="coerce").fillna(0)
+    df["pis"] = pd.to_numeric(df["pis"], errors="coerce").fillna(0)
+    df["cofins"] = pd.to_numeric(df["cofins"], errors="coerce").fillna(0)
+
+    df["custo_peps"] = df.apply(
+        lambda r: (r["estoque_valor"] / r["estoque_qtd"]) if r["estoque_qtd"] > 0 else 0.0,
+        axis=1,
+    )
+    df["custo"] = df.apply(
+        lambda r: r["custo_peps"] if r["custo_peps"] > 0 else r["custo_referencia"],
+        axis=1,
+    )
+
+    df = df.rename(columns={
+        "codigo": "Código",
+        "codigo_barras": "Código de Barras",
+        "nome": "Nome",
+        "categoria": "Categoria",
+        "unidade": "Unidade",
+        "custo": "Custo",
+        "preco_venda": "Preço",
+        "estoque_qtd": "Estoque",
+        "estoque_minimo": "Estoque Mínimo",
+        "custo_peps": "Custo PEPS",
+        "custo_referencia": "Custo Referência",
+        "estoque_valor": "Valor Estoque",
+        "ncm": "NCM",
+        "cst": "CST",
+        "icms": "ICMS",
+        "pis": "PIS",
+        "cofins": "COFINS",
+    })
+
+    return df
+
+
+def buscar_produto_por_codigo_exato(codigo):
+    """
+    Busca exata por SKU interno ou código de barras.
+    Pensado para leitor de código de barras e integrações futuras.
+    """
+    codigo_norm = normalizar_codigo_produto(codigo)
+    if not codigo_norm:
+        return None
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT id
+        FROM produtos
+        WHERE ativo = 1
+          AND (
+            UPPER(TRIM(codigo)) = ?
+            OR UPPER(TRIM(codigo_barras)) = ?
+          )
+        LIMIT 1
+    """, (codigo_norm, codigo_norm))
+    row = cur.fetchone()
+    c.close()
+
+    if not row:
+        return None
+
+    cat = produtos_catalogo_df()
+    if cat.empty:
+        return None
+
+    encontrado = cat[cat["id"] == row["id"]]
+    if encontrado.empty:
+        return None
+
+    return encontrado.iloc[0].to_dict()
+
+
+def buscar_produtos_catalogo(termo="", limite=50):
+    """
+    Busca operacional por nome, SKU ou código de barras.
+    Prioriza match exato de código (barcode) e depois parcial em nome/código.
+    """
+    df = produtos_catalogo_df()
+    if df.empty:
+        return df
+
+    termo = str(termo or "").strip()
+    if not termo:
+        return df.head(limite)
+
+    exato = buscar_produto_por_codigo_exato(termo)
+    if exato:
+        return pd.DataFrame([exato])
+
+    termo_lower = termo.lower()
+    termo_upper = normalizar_codigo_produto(termo)
+
+    mask = (
+        df["Nome"].str.lower().str.contains(termo_lower, na=False, regex=False)
+        | df["Código"].fillna("").str.upper().str.contains(termo_upper, na=False, regex=False)
+        | df["Código de Barras"].fillna("").str.upper().str.contains(termo_upper, na=False, regex=False)
+    )
+
+    return df[mask].head(limite)
+
+
+PDV_FORMAS_PAGAMENTO = ["Dinheiro", "PIX", "Débito", "Crédito"]
+PDV_STATUS_VENDA_FINALIZADA = "FINALIZADA"
+PDV_STATUS_VENDA_CANCELADA = "CANCELADA"
+PDV_STATUS_CAIXA_ABERTO = "ABERTO"
+PDV_STATUS_CAIXA_FECHADO = "FECHADO"
+
+
+def normalizar_forma_pagamento(forma):
+    texto = str(forma or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+
+    if "pix" in texto:
+        return "PIX"
+    if "cred" in texto:
+        return "Crédito"
+    if "deb" in texto:
+        return "Débito"
+    if "din" in texto or "cash" in texto:
+        return "Dinheiro"
+    return str(forma or "Outros").strip() or "Outros"
+
+
+def caixa_row_para_dict(row):
+    if row is None:
+        return None
+    return dict(row) if not isinstance(row, dict) else row
+
+
+def caixa_aberto():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT *
+        FROM pdv_caixas
+        WHERE status = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (PDV_STATUS_CAIXA_ABERTO,))
+    row = cur.fetchone()
+    c.close()
+    return caixa_row_para_dict(row)
+
+
+def buscar_caixa(caixa_id):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM pdv_caixas WHERE id = ?", (int(caixa_id),))
+    row = cur.fetchone()
+    c.close()
+    return caixa_row_para_dict(row)
+
+
+def abrir_caixa(operador, valor_inicial, observacao=""):
+    valor_inicial = float(valor_inicial or 0)
+    if valor_inicial < 0:
+        raise ValueError("Informe um valor inicial válido (>= 0).")
+
+    if caixa_aberto():
+        raise ValueError("Já existe um caixa aberto. Feche o caixa atual antes de abrir outro.")
+
+    agora = pd.Timestamp.now()
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO pdv_caixas
+        (operador_abertura, data_abertura, hora_abertura, valor_inicial, status, observacao_abertura)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        str(operador or "Operador"),
+        str(agora.date()),
+        agora.strftime("%H:%M:%S"),
+        valor_inicial,
+        PDV_STATUS_CAIXA_ABERTO,
+        str(observacao or "").strip(),
+    ))
+    caixa_id = cur.lastrowid
+    c.commit()
+    c.close()
+    return caixa_id
+
+
+def _pagamentos_por_forma_caixa(cur, caixa_id):
+    cur.execute("""
+        SELECT p.forma, COALESCE(SUM(p.valor), 0) AS total_valor, COALESCE(SUM(p.troco), 0) AS total_troco
+        FROM pdv_venda_pagamentos p
+        INNER JOIN pdv_vendas v ON v.id = p.venda_id
+        WHERE v.caixa_id = ?
+          AND v.status = ?
+        GROUP BY p.forma
+    """, (int(caixa_id), PDV_STATUS_VENDA_FINALIZADA))
+    rows = cur.fetchall()
+
+    totais = {"Dinheiro": 0.0, "PIX": 0.0, "Crédito": 0.0, "Débito": 0.0, "Outros": 0.0}
+    for row in rows:
+        chave = normalizar_forma_pagamento(row["forma"])
+        if chave not in totais:
+            totais["Outros"] += float(row["total_valor"] or 0)
+        else:
+            totais[chave] += float(row["total_valor"] or 0)
+    return totais
+
+
+def resumo_caixa(caixa_id):
+    caixa = buscar_caixa(caixa_id)
+    if not caixa:
+        raise ValueError("Caixa não encontrado.")
+
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+        SELECT
+            COUNT(CASE WHEN status = ? THEN 1 END) AS qtd_vendas,
+            COUNT(CASE WHEN status = ? THEN 1 END) AS qtd_cancelamentos,
+            COALESCE(SUM(CASE WHEN status = ? THEN total ELSE 0 END), 0) AS total_vendido,
+            COALESCE(SUM(CASE WHEN status = ? THEN desconto ELSE 0 END), 0) AS total_descontos,
+            COALESCE(SUM(CASE WHEN status = ? THEN troco ELSE 0 END), 0) AS total_troco,
+            COALESCE(SUM(CASE WHEN status = ? AND nfce_status = 'PENDENTE' THEN 1 ELSE 0 END), 0) AS nfce_pendencias
+        FROM pdv_vendas
+        WHERE caixa_id = ?
+    """, (
+        PDV_STATUS_VENDA_FINALIZADA,
+        PDV_STATUS_VENDA_CANCELADA,
+        PDV_STATUS_VENDA_FINALIZADA,
+        PDV_STATUS_VENDA_FINALIZADA,
+        PDV_STATUS_VENDA_FINALIZADA,
+        PDV_STATUS_VENDA_FINALIZADA,
+        int(caixa_id),
+    ))
+    agg = dict(cur.fetchone())
+    pagamentos = _pagamentos_por_forma_caixa(cur, caixa_id)
+    c.close()
+
+    valor_inicial = float(caixa.get("valor_inicial", 0) or 0)
+    total_dinheiro = float(pagamentos.get("Dinheiro", 0) or 0)
+    total_troco = float(agg.get("total_troco", 0) or 0)
+    valor_esperado_dinheiro = valor_inicial + total_dinheiro - total_troco
+    valor_contado = caixa.get("valor_contado")
+    diferenca = None
+    if valor_contado is not None:
+        diferenca = float(valor_contado) - valor_esperado_dinheiro
+
+    qtd_vendas = int(agg.get("qtd_vendas", 0) or 0)
+    total_vendido = float(agg.get("total_vendido", 0) or 0)
+
+    return {
+        "caixa": caixa,
+        "qtd_vendas": qtd_vendas,
+        "qtd_cancelamentos": int(agg.get("qtd_cancelamentos", 0) or 0),
+        "total_vendido": total_vendido,
+        "total_descontos": float(agg.get("total_descontos", 0) or 0),
+        "total_dinheiro": total_dinheiro,
+        "total_pix": float(pagamentos.get("PIX", 0) or 0),
+        "total_credito": float(pagamentos.get("Crédito", 0) or 0),
+        "total_debito": float(pagamentos.get("Débito", 0) or 0),
+        "total_outros": float(pagamentos.get("Outros", 0) or 0),
+        "valor_inicial": valor_inicial,
+        "valor_esperado_dinheiro": valor_esperado_dinheiro,
+        "valor_contado": valor_contado,
+        "diferenca_dinheiro": diferenca,
+        "total_troco": total_troco,
+        "ticket_medio": (total_vendido / qtd_vendas) if qtd_vendas else 0.0,
+        "nfce_pendencias": int(agg.get("nfce_pendencias", 0) or 0),
+    }
+
+
+def fechar_caixa(caixa_id, operador, valor_contado, observacao=""):
+    caixa = buscar_caixa(caixa_id)
+    if not caixa:
+        raise ValueError("Caixa não encontrado.")
+    if caixa.get("status") != PDV_STATUS_CAIXA_ABERTO:
+        raise ValueError("Este caixa já está fechado.")
+
+    valor_contado = float(valor_contado or 0)
+    if valor_contado < 0:
+        raise ValueError("Informe o valor contado em dinheiro (>= 0).")
+
+    resumo = resumo_caixa(caixa_id)
+    agora = pd.Timestamp.now()
+    diferenca = valor_contado - resumo["valor_esperado_dinheiro"]
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        UPDATE pdv_caixas
+        SET operador_fechamento = ?,
+            data_fechamento = ?,
+            hora_fechamento = ?,
+            valor_contado = ?,
+            status = ?,
+            observacao_fechamento = ?,
+            total_vendido = ?,
+            total_descontos = ?,
+            total_dinheiro = ?,
+            total_pix = ?,
+            total_credito = ?,
+            total_debito = ?,
+            qtd_vendas = ?,
+            qtd_cancelamentos = ?,
+            valor_esperado_dinheiro = ?,
+            diferenca_dinheiro = ?,
+            nfce_pendencias = ?
+        WHERE id = ?
+    """, (
+        str(operador or "Operador"),
+        str(agora.date()),
+        agora.strftime("%H:%M:%S"),
+        valor_contado,
+        PDV_STATUS_CAIXA_FECHADO,
+        str(observacao or "").strip(),
+        resumo["total_vendido"],
+        resumo["total_descontos"],
+        resumo["total_dinheiro"],
+        resumo["total_pix"],
+        resumo["total_credito"],
+        resumo["total_debito"],
+        resumo["qtd_vendas"],
+        resumo["qtd_cancelamentos"],
+        resumo["valor_esperado_dinheiro"],
+        diferenca,
+        resumo["nfce_pendencias"],
+        int(caixa_id),
+    ))
+    c.commit()
+    c.close()
+    resumo["valor_contado"] = valor_contado
+    resumo["diferenca_dinheiro"] = diferenca
+    resumo["caixa"] = buscar_caixa(caixa_id)
+    return resumo
+
+
+def relatorio_vendas_pdv(data_ini, data_fim, operador="", forma=""):
+    data_ini = str(data_ini)
+    data_fim = str(data_fim)
+    operador = str(operador or "").strip()
+    forma_filtro = normalizar_forma_pagamento(forma) if str(forma or "").strip() else ""
+
+    c = conn()
+    params = [data_ini, data_fim]
+    filtro_operador = ""
+    if operador:
+        filtro_operador = " AND v.operador = ? "
+        params.append(operador)
+
+    df_vendas = pd.read_sql_query(f"""
+        SELECT
+            v.id AS venda_id,
+            v.data,
+            v.hora,
+            v.operador,
+            v.caixa_id,
+            v.subtotal,
+            v.desconto,
+            v.total,
+            v.troco,
+            v.status,
+            v.nfce_status
+        FROM pdv_vendas v
+        WHERE v.data BETWEEN ? AND ?
+          AND v.status = ?
+          {filtro_operador}
+        ORDER BY v.data DESC, v.hora DESC, v.id DESC
+    """, c, params=[*params, PDV_STATUS_VENDA_FINALIZADA])
+
+    if df_vendas.empty:
+        c.close()
+        return {
+            "vendas": df_vendas,
+            "pagamentos": pd.DataFrame(),
+            "totais_forma": {},
+            "qtd_vendas": 0,
+            "total_geral": 0.0,
+            "total_descontos": 0.0,
+            "ticket_medio": 0.0,
+        }
+
+    venda_ids = df_vendas["venda_id"].tolist()
+    placeholders = ",".join(["?"] * len(venda_ids))
+    df_pag = pd.read_sql_query(f"""
+        SELECT p.venda_id, p.forma, p.valor, p.troco
+        FROM pdv_venda_pagamentos p
+        WHERE p.venda_id IN ({placeholders})
+    """, c, params=venda_ids)
+    c.close()
+
+    if not df_pag.empty:
+        df_pag["forma_norm"] = df_pag["forma"].apply(normalizar_forma_pagamento)
+        if forma_filtro:
+            venda_ids_forma = df_pag.loc[df_pag["forma_norm"] == forma_filtro, "venda_id"].unique().tolist()
+            df_vendas = df_vendas[df_vendas["venda_id"].isin(venda_ids_forma)]
+            df_pag = df_pag[df_pag["venda_id"].isin(venda_ids_forma)]
+
+    totais_forma = {}
+    if not df_pag.empty:
+        for forma_nome, grp in df_pag.groupby("forma_norm"):
+            totais_forma[forma_nome] = float(grp["valor"].sum())
+
+    qtd = len(df_vendas)
+    total_geral = float(df_vendas["total"].sum()) if qtd else 0.0
+    total_descontos = float(df_vendas["desconto"].sum()) if qtd else 0.0
+
+    return {
+        "vendas": df_vendas,
+        "pagamentos": df_pag,
+        "totais_forma": totais_forma,
+        "qtd_vendas": qtd,
+        "total_geral": total_geral,
+        "total_descontos": total_descontos,
+        "ticket_medio": (total_geral / qtd) if qtd else 0.0,
+    }
+
+
+def pdv_inicializar_estado():
+    if "pdv_carrinho" not in st.session_state:
+        st.session_state["pdv_carrinho"] = []
+    if "pdv_pagamentos" not in st.session_state:
+        st.session_state["pdv_pagamentos"] = []
+    if "pdv_desconto" not in st.session_state:
+        st.session_state["pdv_desconto"] = 0.0
+    if "pdv_qtd_rapida" not in st.session_state:
+        st.session_state["pdv_qtd_rapida"] = 1.0
+    if "pdv_busca" not in st.session_state:
+        st.session_state["pdv_busca"] = ""
+    if "pdv_forma_sel" not in st.session_state:
+        st.session_state["pdv_forma_sel"] = "PIX"
+    if "pdv_valor_pg" not in st.session_state:
+        st.session_state["pdv_valor_pg"] = 0.0
+
+
+def pdv_preparar_estado_widgets():
+    """
+    Aplica resets/sync antes de instanciar widgets com key.
+    Nunca alterar pdv_desconto, pdv_busca ou pdv_valor_pg depois dos inputs.
+    """
+    if st.session_state.pop("_pdv_reset_venda", False):
+        st.session_state["pdv_carrinho"] = []
+        st.session_state["pdv_pagamentos"] = []
+        st.session_state["pdv_desconto"] = 0.0
+        st.session_state["pdv_busca"] = ""
+        st.session_state["pdv_valor_pg"] = 0.0
+        st.session_state.pop("_pdv_falta_ref", None)
+    elif st.session_state.pop("_pdv_clear_busca", False):
+        st.session_state["pdv_busca"] = ""
+
+    if st.session_state.pop("_pdv_sync_pagamento", False):
+        resumo = pdv_resumo(
+            carrinho=st.session_state.get("pdv_carrinho", []),
+            desconto=float(st.session_state.get("pdv_desconto", 0) or 0),
+            pagamentos=st.session_state.get("pdv_pagamentos", []),
+        )
+        referencia = resumo["falta"] if resumo["falta"] > 0.009 else resumo["total"]
+        st.session_state["pdv_valor_pg"] = float(referencia or 0)
+        st.session_state["_pdv_falta_ref"] = referencia
+
+
+def pdv_marcar_sync_pagamento():
+    st.session_state["_pdv_sync_pagamento"] = True
+
+
+def pdv_on_desconto_change():
+    pdv_marcar_sync_pagamento()
+
+
+def pdv_item_subtotal(item):
+    return float(item.get("quantidade", 0) or 0) * float(item.get("preco_unitario", 0) or 0)
+
+
+def pdv_sincronizar_carrinho(carrinho=None):
+    carrinho = carrinho if carrinho is not None else st.session_state.get("pdv_carrinho", [])
+    for item in carrinho:
+        item["subtotal"] = pdv_item_subtotal(item)
+    return carrinho
+
+
+def pdv_validar_precos_carrinho(carrinho):
+    erros = []
+    for item in carrinho:
+        if float(item.get("preco_unitario", 0) or 0) <= 0.001:
+            nome = item.get("nome") or item.get("codigo") or "Produto"
+            erros.append(f"{nome}: preço não cadastrado")
+    return erros
+
+
+def pdv_on_remover_item(uid):
+    pdv_remover_item(uid)
+    pdv_marcar_sync_pagamento()
+
+
+def pdv_on_finalizar_venda(operador_nome):
+    if not caixa_aberto():
+        st.session_state["_pdv_error"] = "Abra o caixa antes de finalizar a venda."
+        return
+
+    try:
+        venda_id, resumo_final = pdv_finalizar_venda(
+            list(st.session_state["pdv_carrinho"]),
+            list(st.session_state["pdv_pagamentos"]),
+            float(st.session_state.get("pdv_desconto", 0) or 0),
+            operador_nome,
+        )
+        st.session_state["_pdv_reset_venda"] = True
+        st.session_state["_pdv_sync_pagamento"] = True
+        st.session_state["_pdv_success"] = (
+            f"Venda #{venda_id} • Total {moeda(resumo_final['total'])} • "
+            f"Troco {moeda(resumo_final['troco'])}"
+        )
+    except Exception as e:
+        st.session_state["_pdv_error"] = str(e)
+
+
+def pdv_produto_para_item(prod_row, quantidade=1.0):
+    qtd = float(quantidade)
+    preco = float(prod_row.get("Preço", 0) or 0)
+    return {
+        "uid": uuid.uuid4().hex[:10],
+        "produto_id": int(prod_row["id"]),
+        "codigo": prod_row.get("Código") or "",
+        "nome": prod_row.get("Nome") or "",
+        "unidade": prod_row.get("Unidade") or "UN",
+        "quantidade": qtd,
+        "preco_unitario": preco,
+        "subtotal": qtd * preco,
+        "ncm": prod_row.get("NCM") or "",
+        "cst": prod_row.get("CST") or "",
+        "icms": float(prod_row.get("ICMS", 0) or 0),
+        "pis": float(prod_row.get("PIS", 0) or 0),
+        "cofins": float(prod_row.get("COFINS", 0) or 0),
+    }
+
+
+def pdv_on_busca_change():
+    """Enter/leitor: código exato ou match único adiciona ao pedido."""
+    termo = str(st.session_state.get("pdv_busca", "") or "").strip()
+    if not termo:
+        return
+
+    if not caixa_aberto():
+        st.session_state["_pdv_add_warning"] = "Abra o caixa antes de vender."
+        return
+
+    exato = buscar_produto_por_codigo_exato(termo)
+    alvo = pd.Series(exato) if exato else pdv_resolver_busca(termo)
+    if alvo is None:
+        return
+
+    qtd = float(st.session_state.get("pdv_qtd_rapida", 1.0) or 1.0)
+    pdv_adicionar_ao_carrinho(alvo, qtd)
+    st.session_state["_pdv_clear_busca"] = True
+    st.session_state["_pdv_toast"] = f"Adicionado: {alvo.get('Nome', 'Produto')}"
+
+
+def pdv_on_adicionar_click():
+    termo = str(st.session_state.get("pdv_busca", "") or "").strip()
+    if not termo:
+        st.session_state["_pdv_add_warning"] = "Digite um produto para adicionar."
+        return
+
+    if not caixa_aberto():
+        st.session_state["_pdv_add_warning"] = "Abra o caixa antes de vender."
+        return
+
+    alvo = pdv_resolver_busca(termo)
+    if alvo is not None:
+        qtd = float(st.session_state.get("pdv_qtd_rapida", 1.0) or 1.0)
+        pdv_adicionar_ao_carrinho(alvo, qtd)
+        st.session_state["_pdv_clear_busca"] = True
+        st.session_state["_pdv_toast"] = f"Adicionado: {alvo.get('Nome', 'Produto')}"
+    else:
+        st.session_state["_pdv_add_warning"] = "Selecione um produto abaixo ou refine a busca."
+
+
+def pdv_on_pick_produto(produto_id):
+    if not caixa_aberto():
+        st.session_state["_pdv_add_warning"] = "Abra o caixa antes de vender."
+        return
+
+    catalogo = produtos_catalogo_df()
+    if catalogo.empty:
+        return
+
+    encontrado = catalogo[catalogo["id"] == int(produto_id)]
+    if encontrado.empty:
+        return
+
+    qtd = float(st.session_state.get("pdv_qtd_rapida", 1.0) or 1.0)
+    prod = encontrado.iloc[0]
+    pdv_adicionar_ao_carrinho(prod, qtd)
+    st.session_state["_pdv_clear_busca"] = True
+    st.session_state["_pdv_toast"] = f"Adicionado: {prod.get('Nome', 'Produto')}"
+
+
+def pdv_on_limpar_busca():
+    st.session_state["_pdv_clear_busca"] = True
+
+
+def pdv_on_cancelar_venda():
+    pdv_limpar_venda()
+
+
+def pdv_resolver_busca(termo):
+    """Retorna produto único para adicionar ou None se precisar escolher na lista."""
+    termo = str(termo or "").strip()
+    if not termo:
+        return None
+
+    exato = buscar_produto_por_codigo_exato(termo)
+    if exato:
+        return pd.Series(exato)
+
+    resultados = buscar_produtos_catalogo(termo, limite=8)
+    if len(resultados) == 1:
+        return resultados.iloc[0]
+
+    return None
+
+
+def pdv_adicionar_ao_carrinho(prod_row, quantidade=1.0):
+    item = pdv_produto_para_item(prod_row, quantidade)
+    carrinho = st.session_state["pdv_carrinho"]
+
+    for existente in carrinho:
+        if (
+            existente["produto_id"] == item["produto_id"]
+            and abs(existente["preco_unitario"] - item["preco_unitario"]) < 0.001
+        ):
+            existente["quantidade"] += item["quantidade"]
+            existente["subtotal"] = existente["quantidade"] * existente["preco_unitario"]
+            pdv_marcar_sync_pagamento()
+            return existente
+
+    carrinho.append(item)
+    pdv_marcar_sync_pagamento()
+    return item
+
+
+def pdv_remover_item(uid):
+    st.session_state["pdv_carrinho"] = [
+        i for i in st.session_state["pdv_carrinho"] if i["uid"] != uid
+    ]
+    pdv_marcar_sync_pagamento()
+
+
+def pdv_limpar_venda():
+    st.session_state["_pdv_reset_venda"] = True
+
+
+def pdv_resumo_atual():
+    return pdv_resumo(
+        carrinho=st.session_state.get("pdv_carrinho", []),
+        desconto=float(st.session_state.get("pdv_desconto", 0) or 0),
+        pagamentos=st.session_state.get("pdv_pagamentos", []),
+    )
+
+
+def pdv_resumo(carrinho=None, desconto=None, pagamentos=None):
+    carrinho = pdv_sincronizar_carrinho(carrinho if carrinho is not None else None)
+    desconto = float(st.session_state.get("pdv_desconto", 0) if desconto is None else desconto)
+    pagamentos = pagamentos if pagamentos is not None else st.session_state.get("pdv_pagamentos", [])
+
+    subtotal = sum(pdv_item_subtotal(i) for i in carrinho)
+    total = max(subtotal - desconto, 0.0)
+    pago = sum(float(p.get("valor", 0) or 0) for p in pagamentos)
+    falta = max(total - pago, 0.0)
+    troco = max(pago - total, 0.0)
+
+    return {
+        "subtotal": subtotal,
+        "desconto": desconto,
+        "total": total,
+        "pago": pago,
+        "falta": falta,
+        "troco": troco,
+        "itens": len(carrinho),
+    }
+
+
+def pdv_validar_estoque_carrinho(carrinho):
+    agregado = {}
+    nomes = {}
+
+    for item in carrinho:
+        pid = int(item["produto_id"])
+        agregado[pid] = agregado.get(pid, 0.0) + float(item["quantidade"])
+        nomes[pid] = item.get("nome") or str(pid)
+
+    erros = []
+    for pid, qtd_necessaria in agregado.items():
+        qtd_estoque, _, _ = estoque_produto(pid)
+        if qtd_estoque + 0.0001 < qtd_necessaria:
+            erros.append(
+                f"{nomes[pid]}: estoque {qtd_estoque:.2f}, necessário {qtd_necessaria:.2f}"
+            )
+    return erros
+
+
+def pdv_adicionar_pagamento(forma, valor, troco=0.0):
+    valor = float(valor or 0)
+    if valor <= 0:
+        raise ValueError("Informe um valor de pagamento maior que zero.")
+
+    st.session_state["pdv_pagamentos"].append({
+        "uid": uuid.uuid4().hex[:8],
+        "forma": forma,
+        "valor": valor,
+        "troco": float(troco or 0),
+    })
+    pdv_marcar_sync_pagamento()
+
+
+def pdv_remover_pagamento(uid):
+    st.session_state["pdv_pagamentos"] = [
+        p for p in st.session_state["pdv_pagamentos"] if p["uid"] != uid
+    ]
+    pdv_marcar_sync_pagamento()
+
+
+def pdv_on_adicionar_pagamento():
+    try:
+        pdv_adicionar_pagamento(
+            st.session_state.get("pdv_forma_sel", "PIX"),
+            st.session_state.get("pdv_valor_pg", 0),
+        )
+    except Exception as e:
+        st.session_state["_pdv_error"] = str(e)
+
+
+def pdv_on_quick_pagamento(forma, valor):
+    try:
+        pdv_adicionar_pagamento(forma, float(valor or 0))
+    except Exception as e:
+        st.session_state["_pdv_error"] = str(e)
+
+
+def pdv_on_remover_pagamento(uid):
+    pdv_remover_pagamento(uid)
+
+
+def pdv_finalizar_venda(carrinho, pagamentos, desconto, operador):
+    if not carrinho:
+        raise ValueError("Adicione itens à venda antes de finalizar.")
+
+    caixa = caixa_aberto()
+    if not caixa:
+        raise ValueError("Abra o caixa antes de finalizar a venda.")
+    caixa_id = int(caixa["id"])
+
+    carrinho = pdv_sincronizar_carrinho(list(carrinho))
+    erros_preco = pdv_validar_precos_carrinho(carrinho)
+    if erros_preco:
+        raise ValueError(" | ".join(erros_preco))
+
+    resumo = pdv_resumo(carrinho, desconto, pagamentos)
+    if resumo["falta"] > 0.009:
+        raise ValueError(f"Pagamento incompleto. Falta {moeda(resumo['falta'])}.")
+
+    erros = pdv_validar_estoque_carrinho(carrinho)
+    if erros:
+        raise ValueError(" | ".join(erros))
+
+    agora = pd.Timestamp.now()
+    data_mov = str(agora.date())
+    hora = agora.strftime("%H:%M:%S")
+
+    movimentos = []
+    for item in carrinho:
+        resultado = saida_peps(
+            int(item["produto_id"]),
+            data_mov,
+            float(item["quantidade"]),
+            float(item["preco_unitario"]),
+            "Venda",
+            "",
+            f"PDV|uid:{item['uid']}",
+            pdv_venda_id=None,
+        )
+        movimentos.append((item, resultado))
+
+    c = conn()
+    cur = c.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO pdv_vendas
+            (data, hora, operador, subtotal, desconto, total, troco, status, nfce_status, caixa_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDENTE', ?)
+        """, (
+            data_mov,
+            hora,
+            operador,
+            resumo["subtotal"],
+            resumo["desconto"],
+            resumo["total"],
+            resumo["troco"],
+            PDV_STATUS_VENDA_FINALIZADA,
+            caixa_id,
+        ))
+        venda_id = cur.lastrowid
+
+        for item, resultado in movimentos:
+            mov_id = resultado.get("movimentacao_id")
+            cmv = float(resultado.get("cmv_peps", 0) or 0)
+
+            if mov_id:
+                cur.execute(
+                    "UPDATE movimentacoes SET pdv_venda_id = ? WHERE id = ?",
+                    (venda_id, mov_id),
+                )
+
+            cur.execute("""
+                INSERT INTO pdv_venda_itens
+                (venda_id, produto_id, codigo, nome, unidade, quantidade, preco_unitario,
+                 subtotal, ncm, cst, icms, pis, cofins, cmv_peps, movimentacao_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                venda_id,
+                int(item["produto_id"]),
+                item.get("codigo"),
+                item.get("nome"),
+                item.get("unidade"),
+                float(item["quantidade"]),
+                float(item["preco_unitario"]),
+                float(item["subtotal"]),
+                item.get("ncm"),
+                item.get("cst"),
+                float(item.get("icms", 0) or 0),
+                float(item.get("pis", 0) or 0),
+                float(item.get("cofins", 0) or 0),
+                cmv,
+                mov_id,
+            ))
+
+        for pagamento in pagamentos:
+            cur.execute("""
+                INSERT INTO pdv_venda_pagamentos (venda_id, forma, valor, troco)
+                VALUES (?, ?, ?, ?)
+            """, (
+                venda_id,
+                pagamento.get("forma"),
+                float(pagamento.get("valor", 0) or 0),
+                float(pagamento.get("troco", 0) or 0),
+            ))
+
+        c.commit()
+        return venda_id, resumo
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
+def inserir_produto_catalogo(
+    nome,
+    categoria,
+    unidade,
+    estoque_minimo,
+    preco_venda,
+    codigo="",
+    codigo_barras="",
+    custo_referencia=0.0,
+    ncm="",
+    cst="",
+    icms=0.0,
+    pis=0.0,
+    cofins=0.0,
+):
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+        INSERT INTO produtos
+        (nome, categoria, unidade, estoque_minimo, preco_venda, codigo, codigo_barras,
+         custo_referencia, ncm, cst, icms, pis, cofins)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        nome.strip(),
+        categoria.strip(),
+        unidade,
+        float(estoque_minimo),
+        float(preco_venda),
+        normalizar_codigo_produto(codigo) if str(codigo or "").strip() else None,
+        str(codigo_barras).strip() if str(codigo_barras or "").strip() else None,
+        float(custo_referencia or 0),
+        str(ncm or "").strip(),
+        str(cst or "").strip(),
+        float(icms or 0),
+        float(pis or 0),
+        float(cofins or 0),
+    ))
+
+    produto_id = cur.lastrowid
+
+    if not str(codigo or "").strip():
+        auto_codigo = gerar_proximo_codigo_sku(categoria, nome, cur)
+        cur.execute("UPDATE produtos SET codigo = ? WHERE id = ?", (auto_codigo, produto_id))
+
+    c.commit()
+    c.close()
+    return produto_id
 
 
 def get_or_create(nome, categoria="Mercadoria", unidade="UN"):
@@ -285,6 +1493,11 @@ def get_or_create(nome, categoria="Mercadoria", unidade="UN"):
 
     c.commit()
     i = cur.lastrowid
+    cur.execute(
+        "UPDATE produtos SET codigo = ? WHERE id = ?",
+        (gerar_proximo_codigo_sku(categoria, nome, cur), i)
+    )
+    c.commit()
     c.close()
     return i
 
@@ -338,7 +1551,7 @@ def entrada(pid, data_mov, qtd, vu, fornecedor="", obs="", chave=""):
     c.close()
 
 
-def saida_peps(pid, data_mov, qtd, preco_venda=0, tipo_saida="Venda", motivo_saida="", obs=""):
+def saida_peps(pid, data_mov, qtd, preco_venda=0, tipo_saida="Venda", motivo_saida="", obs="", pdv_venda_id=None):
     c = conn()
     cur = c.cursor()
 
@@ -388,15 +1601,22 @@ def saida_peps(pid, data_mov, qtd, preco_venda=0, tipo_saida="Venda", motivo_sai
     cur.execute("""
         INSERT INTO movimentacoes 
         (data, produto_id, tipo, quantidade, valor_unitario, valor_total, receita_venda,
-         cmv_peps, custo_medio_atual, tipo_saida, motivo_saida, observacao)
-        VALUES (?, ?, 'Saída', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         cmv_peps, custo_medio_atual, tipo_saida, motivo_saida, observacao, pdv_venda_id)
+        VALUES (?, ?, 'Saída', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         str(data_mov), pid, qtd, preco_venda, valor_total, receita,
-        cmv, cm, tipo_saida, motivo_saida, obs
+        cmv, cm, tipo_saida, motivo_saida, obs, pdv_venda_id
     ))
 
+    movimentacao_id = cur.lastrowid
     c.commit()
     c.close()
+
+    return {
+        "movimentacao_id": movimentacao_id,
+        "cmv_peps": cmv,
+        "receita": receita,
+    }
 
 
 # =========================================================
@@ -408,6 +1628,7 @@ def estoque_df():
     df = pd.read_sql_query("""
         SELECT 
             p.id,
+            p.codigo Código,
             p.nome Produto,
             p.categoria Categoria,
             p.unidade Unidade,
@@ -418,7 +1639,7 @@ def estoque_df():
         LEFT JOIN lotes l ON l.produto_id=p.id AND l.qtd_restante>0
         WHERE p.ativo=1
         GROUP BY p.id
-        ORDER BY p.nome
+        ORDER BY p.codigo, p.nome
     """, c)
 
     c.close()
@@ -484,7 +1705,7 @@ def lotes_df():
             l.observacao Observação
         FROM lotes l
         JOIN produtos p ON p.id=l.produto_id
-        ORDER BY p.nome, date(l.data_entrada), l.id
+        ORDER BY p.codigo, p.nome, date(l.data_entrada), l.id
     """, c)
 
     c.close()
@@ -1253,8 +2474,14 @@ def precificacao_df(meta_cmv):
 
 
 # =========================================================
-# DRE GERENCIAL
+# DRE GERENCIAL / CONTAS A PAGAR
 # =========================================================
+CATEGORIAS_DESPESA = [
+    "Aluguel", "Funcionários", "Energia", "Água", "Internet", "Contador",
+    "Taxas/Cartões", "iFood/Delivery", "Marketing", "Manutenção", "Embalagens", "Outros"
+]
+
+
 def despesas_df(inicio=None, fim=None):
     c = conn()
 
@@ -1266,7 +2493,8 @@ def despesas_df(inicio=None, fim=None):
                 categoria Categoria,
                 descricao Descrição,
                 valor Valor,
-                observacao Observação
+                observacao Observação,
+                COALESCE(status, 'Em aberto') Status
             FROM despesas
             WHERE date(data)>=date(?) AND date(data)<date(?)
             ORDER BY date(data) DESC, id DESC
@@ -1279,7 +2507,8 @@ def despesas_df(inicio=None, fim=None):
                 categoria Categoria,
                 descricao Descrição,
                 valor Valor,
-                observacao Observação
+                observacao Observação,
+                COALESCE(status, 'Em aberto') Status
             FROM despesas
             ORDER BY date(data) DESC, id DESC
         """, c)
@@ -1288,27 +2517,160 @@ def despesas_df(inicio=None, fim=None):
     return df
 
 
-def inserir_despesa(data_mov, categoria, descricao, valor, observacao=""):
+def despesas_com_status_df(inicio=None, fim=None):
+    c = conn()
+
+    if inicio and fim:
+        df = pd.read_sql_query("""
+            SELECT
+                id,
+                data,
+                categoria,
+                descricao,
+                valor,
+                observacao,
+                COALESCE(status, 'Em aberto') AS status
+            FROM despesas
+            WHERE date(data)>=date(?) AND date(data)<date(?)
+            ORDER BY date(data) ASC, id ASC
+        """, c, params=(inicio, fim))
+    else:
+        df = pd.read_sql_query("""
+            SELECT
+                id,
+                data,
+                categoria,
+                descricao,
+                valor,
+                observacao,
+                COALESCE(status, 'Em aberto') AS status
+            FROM despesas
+            ORDER BY date(data) ASC, id ASC
+        """, c)
+
+    c.close()
+    return df
+
+
+def situacao_despesa(status, data_ref, hoje=None):
+    hoje = hoje or date.today()
+    status = str(status or "Em aberto").strip()
+
+    if status == "Pago":
+        return "Pago", "🟢 Pago"
+
+    try:
+        venc = pd.Timestamp(data_ref).date()
+    except Exception:
+        venc = hoje
+
+    if venc < hoje:
+        return "Vencida", "🔴 Vencida"
+
+    return "Em aberto", "🟡 Em aberto"
+
+
+def resumo_contas_pagar(df, hoje=None):
+    hoje = hoje or date.today()
+
+    if df is None or df.empty:
+        return {
+            "total_aberto": 0.0,
+            "total_vencidas": 0.0,
+            "total_pagas": 0.0,
+            "total_periodo": 0.0,
+            "qtd_aberto": 0,
+            "qtd_vencidas": 0,
+            "qtd_pagas": 0,
+            "qtd_total": 0,
+        }
+
+    work = df.copy()
+    work["status"] = work["status"].fillna("Em aberto")
+    work["valor"] = work["valor"].astype(float)
+
+    abertas = work[work["status"] != "Pago"]
+    pagas = work[work["status"] == "Pago"]
+
+    vencidas = abertas[
+        abertas["data"].apply(lambda d: pd.Timestamp(d).date() < hoje)
+    ]
+
+    return {
+        "total_aberto": float(abertas["valor"].sum()),
+        "total_vencidas": float(vencidas["valor"].sum()),
+        "total_pagas": float(pagas["valor"].sum()),
+        "total_periodo": float(work["valor"].sum()),
+        "qtd_aberto": len(abertas),
+        "qtd_vencidas": len(vencidas),
+        "qtd_pagas": len(pagas),
+        "qtd_total": len(work),
+    }
+
+
+def filtrar_despesas_contas(df, status_filtro="Todos", categoria="Todas", busca="", hoje=None):
+    hoje = hoje or date.today()
+
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    if categoria and categoria != "Todas":
+        out = out[out["categoria"] == categoria]
+
+    if busca and str(busca).strip():
+        termo = str(busca).strip().lower()
+        out = out[
+            out["descricao"].fillna("").str.lower().str.contains(termo, na=False)
+            | out["categoria"].fillna("").str.lower().str.contains(termo, na=False)
+            | out["observacao"].fillna("").str.lower().str.contains(termo, na=False)
+        ]
+
+    if status_filtro == "Em aberto":
+        out = out[out["status"] != "Pago"]
+    elif status_filtro == "Pago":
+        out = out[out["status"] == "Pago"]
+    elif status_filtro == "Vencidas":
+        out = out[
+            (out["status"] != "Pago")
+            & out["data"].apply(lambda d: pd.Timestamp(d).date() < hoje)
+        ]
+
+    if out.empty:
+        return out
+
+    out = out.copy()
+    out["_situacao_ordem"] = out.apply(
+        lambda r: 0 if situacao_despesa(r["status"], r["data"], hoje)[0] == "Vencida"
+        else (1 if situacao_despesa(r["status"], r["data"], hoje)[0] == "Em aberto" else 2),
+        axis=1,
+    )
+    out = out.sort_values(["_situacao_ordem", "data", "id"]).drop(columns=["_situacao_ordem"])
+    return out
+
+
+def inserir_despesa(data_mov, categoria, descricao, valor, observacao="", status="Em aberto"):
     c = conn()
     cur = c.cursor()
 
     cur.execute("""
-        INSERT INTO despesas (data, categoria, descricao, valor, observacao)
-        VALUES (?, ?, ?, ?, ?)
-    """, (str(data_mov), categoria, descricao, float(valor), observacao))
+        INSERT INTO despesas (data, categoria, descricao, valor, observacao, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (str(data_mov), categoria, descricao, float(valor), observacao, status))
 
     c.commit()
     c.close()
 
 
-def inserir_despesa(data_mov, categoria, descricao, valor, observacao=""):
+def atualizar_status_despesa(id_despesa, status):
     c = conn()
     cur = c.cursor()
 
-    cur.execute("""
-        INSERT INTO despesas (data, categoria, descricao, valor, observacao)
-        VALUES (?, ?, ?, ?, ?)
-    """, (str(data_mov), categoria, descricao, float(valor), observacao))
+    cur.execute(
+        "UPDATE despesas SET status = ? WHERE id = ?",
+        (str(status), int(id_despesa))
+    )
 
     c.commit()
     c.close()
@@ -1366,6 +2728,9 @@ def dre_periodo(inicio, fim):
 # LOGIN SIMPLES + USUÁRIOS
 # =========================================================
 USERS_PATH = Path("usuarios.json")
+AUTH_QUERY_PARAM = "auth"
+AUTH_DIAS_VALIDADE = 7
+
 
 def garantir_usuarios_json():
     if not USERS_PATH.exists():
@@ -1403,12 +2768,132 @@ def autenticar_json(usuario, senha):
     return None
 
 
+def usuario_dict_por_login(login):
+    login = str(login or "").strip()
+    for u in carregar_usuarios():
+        if str(u.get("usuario", "")).strip() == login:
+            if u.get("ativo", True) is False:
+                return None
+            return {
+                "usuario": u.get("usuario", ""),
+                "nome": u.get("nome", u.get("usuario", "")),
+                "tipo": u.get("tipo", "operador"),
+            }
+    return None
+
+
+def criar_token_sessao(login_usuario):
+    token = secrets.token_urlsafe(32)
+    agora = pd.Timestamp.now()
+    expira = agora + pd.Timedelta(days=AUTH_DIAS_VALIDADE)
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        INSERT INTO sessoes_auth (token, usuario, criado_em, expira_em)
+        VALUES (?, ?, ?, ?)
+    """, (token, str(login_usuario), str(agora), str(expira)))
+    c.commit()
+    c.close()
+    return token
+
+
+def revogar_token_sessao(token):
+    if not token:
+        return
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM sessoes_auth WHERE token = ?", (str(token),))
+    c.commit()
+    c.close()
+
+
+def buscar_usuario_por_token(token):
+    if not token:
+        return None
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        SELECT usuario
+        FROM sessoes_auth
+        WHERE token = ?
+          AND datetime(expira_em) > datetime('now')
+    """, (str(token),))
+    row = cur.fetchone()
+    c.close()
+
+    if not row:
+        return None
+
+    user = usuario_dict_por_login(row["usuario"])
+    if not user:
+        revogar_token_sessao(token)
+    return user
+
+
+def limpar_auth_url():
+    if AUTH_QUERY_PARAM in st.query_params:
+        del st.query_params[AUTH_QUERY_PARAM]
+
+
+def persistir_login(user):
+    token = criar_token_sessao(user["usuario"])
+    st.session_state["usuario_logado"] = user
+    st.session_state["auth_token"] = token
+    st.query_params[AUTH_QUERY_PARAM] = token
+
+
+def sincronizar_auth_url():
+    if not usuario_logado():
+        return
+
+    token = st.session_state.get("auth_token")
+    if not token:
+        token = criar_token_sessao(st.session_state["usuario_logado"]["usuario"])
+        st.session_state["auth_token"] = token
+
+    if st.query_params.get(AUTH_QUERY_PARAM) != token:
+        st.query_params[AUTH_QUERY_PARAM] = token
+
+
+def restaurar_login_persistente():
+    if st.session_state.get("usuario_logado"):
+        return True
+
+    token = st.query_params.get(AUTH_QUERY_PARAM)
+    if not token:
+        return False
+
+    user = buscar_usuario_por_token(token)
+    if user:
+        st.session_state["usuario_logado"] = user
+        st.session_state["auth_token"] = token
+        return True
+
+    limpar_auth_url()
+    return False
+
+
+def fazer_logout():
+    token = st.session_state.get("auth_token") or st.query_params.get(AUTH_QUERY_PARAM)
+    revogar_token_sessao(token)
+    st.session_state.pop("usuario_logado", None)
+    st.session_state.pop("auth_token", None)
+    limpar_auth_url()
+    st.rerun()
+
+
 def usuario_logado():
     return st.session_state.get("usuario_logado")
 
 
 def exigir_login():
+    restaurar_login_persistente()
+
     if usuario_logado():
+        sincronizar_auth_url()
         return
 
     st.markdown("""
@@ -1426,7 +2911,7 @@ def exigir_login():
         if entrar:
             user = autenticar_json(usuario, senha)
             if user:
-                st.session_state["usuario_logado"] = user
+                persistir_login(user)
                 st.rerun()
             else:
                 st.error("Usuário ou senha inválidos.")
@@ -1446,6 +2931,7 @@ def menus_por_perfil():
         "DRE Gerencial",
         "Contas a Pagar",
         "Curva ABC",
+        "Relatório Vendas PDV",
         "Produtos",
         "Configurações",
         "Usuários",
@@ -1453,6 +2939,7 @@ def menus_por_perfil():
         "Importar Cupom Foto",
         "Entrada Manual",
         "Lançar Saída",
+        "⚡ Operacional",
         "Estoque Atual",
         "Lotes",
         "Movimentações",
@@ -1473,6 +2960,7 @@ def menus_por_perfil():
             "DRE Gerencial",
             "Contas a Pagar",
             "Curva ABC",
+            "Relatório Vendas PDV",
             "Estoque Atual",
             "Movimentações",
             "Exportar"
@@ -1480,6 +2968,7 @@ def menus_por_perfil():
 
     # operador
     return [
+        "⚡ Operacional",
         "Importar Nota",
         "Importar Cupom Foto",
         "Entrada Manual",
@@ -1499,8 +2988,7 @@ def logout_sidebar():
     st.sidebar.write(f"👤 **{user.get('nome', user.get('usuario'))}**")
     st.sidebar.caption(f"Perfil: {user.get('tipo', '-')}")
     if st.sidebar.button("Sair"):
-        st.session_state.pop("usuario_logado", None)
-        st.rerun()
+        fazer_logout()
 
 
 # =========================================================
@@ -1512,7 +3000,16 @@ garantir_usuarios_json()
 exigir_login()
 user = st.session_state.get("usuario_logado", {})
 
-st.markdown("""
+menus_permitidos = menus_por_perfil()
+menu = st.radio(
+    "Navegação",
+    menus_permitidos,
+    horizontal=True
+)
+# logout_sidebar()
+
+if menu != "⚡ Operacional":
+    st.markdown("""
 <div style="
     background: linear-gradient(135deg, #111827 0%, #1e3a8a 55%, #2563eb 100%);
     padding: 28px 32px;
@@ -1531,22 +3028,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-menus_permitidos = menus_por_perfil()
-menu = st.radio(
-    "Navegação",
-    menus_permitidos,
-    horizontal=True
-)
-# logout_sidebar()
-
 col_user, col_sair = st.columns([8, 1])
 
 with col_user:
     st.caption(f"👤 {user.get('nome', user.get('usuario'))} | Perfil: {user.get('tipo', '-')}")
 with col_sair:
     if st.button("Sair"):
-        st.session_state.pop("usuario_logado", None)
-        st.rerun()
+        fazer_logout()
 
 pdf = produtos_df()
 
@@ -2836,63 +4324,258 @@ elif menu == "Precificação":
 
 
 # =========================================================
-# DRE GERENCIAL
+# CONTAS A PAGAR
 # =========================================================
 elif menu == "Contas a Pagar":
 
-    st.subheader("💰 Contas a Pagar")
-    st.caption("Gestão financeira operacional.")
-    
+    st.markdown("""
+        <style>
+            .cap-hero {
+                background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #2563eb 100%);
+                color: white;
+                padding: 24px 28px;
+                border-radius: 22px;
+                margin-bottom: 18px;
+                box-shadow: 0 10px 28px rgba(15, 23, 42, 0.14);
+            }
+            .cap-title { font-size: 30px; font-weight: 900; margin-bottom: 4px; }
+            .cap-sub { font-size: 14px; color: #dbeafe; font-weight: 600; }
+            .cap-chip {
+                display: inline-block;
+                margin-top: 12px;
+                background: rgba(255,255,255,.12);
+                border: 1px solid rgba(255,255,255,.18);
+                border-radius: 999px;
+                padding: 6px 12px;
+                font-size: 12px;
+                font-weight: 800;
+            }
+            .cap-resumo-chip {
+                background: #ffffff;
+                border: 1px solid #e5e7eb;
+                border-radius: 14px;
+                padding: 10px 14px;
+                font-size: 13px;
+                color: #475569;
+                font-weight: 700;
+                margin-bottom: 12px;
+            }
+            @media (max-width: 720px) {
+                .cap-hero { padding: 18px 16px; }
+                .cap-title { font-size: 24px; }
+            }
+        </style>
+    """, unsafe_allow_html=True)
 
-    c = conn()
-    despesas = pd.read_sql_query("""
-        SELECT
-            id,
-            data,
-            categoria,
-            descricao,
-            valor,
-            observacao,
-            COALESCE(status, 'Em aberto') AS status
-        FROM despesas
-        ORDER BY date(data) DESC, id DESC
-    """, c)
-    c.close()
+    hoje = date.today()
+    nome_empresa = get_config("nome_empresa", "Restaurante")
 
-    st.markdown("### 📋 Lançamentos")
+    st.markdown(f"""
+        <div class="cap-hero">
+            <div class="cap-title">💰 Contas a Pagar</div>
+            <div class="cap-sub">{nome_empresa} • gestão de despesas operacionais</div>
+            <div class="cap-chip">Controle em aberto, vencidas e pagas</div>
+        </div>
+    """, unsafe_allow_html=True)
 
-    if despesas.empty:
-        st.info("Nenhuma despesa cadastrada.")
-    else:
+    with st.expander("➕ Nova despesa", expanded=False):
+        with st.form("form_contas_pagar_nova"):
+            c_form1, c_form2 = st.columns(2)
+            data_desp = c_form1.date_input("Vencimento", value=hoje, key="cap_data_desp")
+            categoria = c_form2.selectbox("Categoria", CATEGORIAS_DESPESA, key="cap_categoria")
+            descricao = st.text_input("Descrição", key="cap_descricao")
+            c_val, c_obs = st.columns([1, 2])
+            valor = c_val.number_input("Valor", min_value=0.01, step=10.0, key="cap_valor")
+            obs = c_obs.text_input("Observação", key="cap_obs")
+            salvar_nova = st.form_submit_button("Lançar despesa", use_container_width=True)
 
-        for _, row in despesas.iterrows():
-
-            c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1,2,2,2,1,2,1,1])
-
-            c1.write(row["id"])
-            c2.write(row["data"])
-            c3.write(row["categoria"])
-            c4.write(row["descricao"])
-            c5.write(f'R$ {row["valor"]:,.2f}')
-            c6.write(row["observacao"])
-            status = row["status"] if "status" in row else "Em aberto"
-
-            if status == "Pago":
-                c7.success("Pago")
-            else:
-                c7.warning("Em aberto")
-
-            if status != "Pago":
-                if c8.button("✅", key=f"pg_{row['id']}"):
-                    atualizar_status_despesa(row["id"], "Pago")
+            if salvar_nova:
+                if not str(descricao).strip():
+                    st.error("Informe uma descrição para a despesa.")
+                else:
+                    inserir_despesa(data_desp, categoria, descricao.strip(), valor, obs.strip())
+                    st.success("Despesa lançada com sucesso.")
                     st.rerun()
 
-            if c8.button("🗑", key=f"del_{row['id']}"):
-                excluir_despesa(row["id"])
-                st.success("Despesa excluída com sucesso.")
+    f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1.4])
+    periodo = f1.selectbox(
+        "Período",
+        ["Hoje", "Ontem", "Últimos 7 dias", "Últimos 30 dias", "Este mês", "Mês passado", "Personalizado", "Todos"],
+        index=4,
+        key="cap_periodo"
+    )
+
+    data_ini_cap = hoje.replace(day=1)
+    data_fim_cap = hoje
+
+    if periodo == "Personalizado":
+        data_ini_cap = f2.date_input("Data inicial", value=data_ini_cap, key="cap_ini")
+        data_fim_cap = f3.date_input("Data final", value=data_fim_cap, key="cap_fim")
+    else:
+        f2.write("")
+        f3.write("")
+
+    status_filtro = f4.selectbox(
+        "Status",
+        ["Todos", "Em aberto", "Vencidas", "Pago"],
+        key="cap_status"
+    )
+
+    c5, c6, c7 = st.columns([1, 1, 2])
+    categoria_filtro = c5.selectbox(
+        "Categoria",
+        ["Todas"] + CATEGORIAS_DESPESA,
+        key="cap_categoria_filtro"
+    )
+    busca = c6.text_input("Buscar", placeholder="Descrição, categoria...", key="cap_busca")
+    if c7.button("Limpar filtros", use_container_width=True):
+        st.session_state["cap_periodo"] = "Este mês"
+        st.session_state["cap_status"] = "Todos"
+        st.session_state["cap_categoria_filtro"] = "Todas"
+        st.session_state["cap_busca"] = ""
+        st.rerun()
+
+    if periodo == "Todos":
+        df_base = despesas_com_status_df()
+        label_periodo_cap = "Todos os lançamentos"
+    else:
+        inicio_cap, fim_cap = datas_periodo(periodo, data_ini_cap, data_fim_cap)
+        df_base = despesas_com_status_df(inicio_cap, fim_cap)
+        label_periodo_cap = periodo_label(inicio_cap, fim_cap)
+
+    df_filtrado = filtrar_despesas_contas(
+        df_base,
+        status_filtro=status_filtro,
+        categoria=categoria_filtro,
+        busca=busca,
+        hoje=hoje,
+    )
+
+    resumo = resumo_contas_pagar(df_filtrado, hoje)
+
+    st.markdown(f"### Resumo • {label_periodo_cap}")
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        metric_card(
+            "Em aberto",
+            moeda(resumo["total_aberto"]),
+            f"{resumo['qtd_aberto']} lançamento(s)",
+            "warn" if resumo["total_aberto"] > 0 else "good",
+            "💳"
+        )
+    with k2:
+        metric_card(
+            "Vencidas",
+            moeda(resumo["total_vencidas"]),
+            f"{resumo['qtd_vencidas']} pendência(s)",
+            "bad" if resumo["total_vencidas"] > 0 else "good",
+            "🔴"
+        )
+    with k3:
+        metric_card(
+            "Pagas",
+            moeda(resumo["total_pagas"]),
+            f"{resumo['qtd_pagas']} quitada(s)",
+            "good",
+            "✅"
+        )
+    with k4:
+        metric_card(
+            "Total filtrado",
+            moeda(resumo["total_periodo"]),
+            f"{resumo['qtd_total']} lançamento(s)",
+            "blue",
+            "📊"
+        )
+
+    st.markdown(
+        f'<div class="cap-resumo-chip">{resumo["qtd_total"]} lançamento(s) • '
+        f'{moeda(resumo["total_aberto"])} em aberto • '
+        f'{moeda(resumo["total_vencidas"])} vencidas</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### Lançamentos")
+
+    if df_filtrado.empty:
+        st.info("Nenhuma despesa encontrada com os filtros atuais.")
+    else:
+        tabela = df_filtrado.copy()
+        tabela["Situação"] = tabela.apply(
+            lambda r: situacao_despesa(r["status"], r["data"], hoje)[1],
+            axis=1,
+        )
+        tabela["Vencimento"] = pd.to_datetime(tabela["data"]).dt.strftime("%d/%m/%Y")
+        tabela["Valor"] = tabela["valor"].astype(float)
+        tabela["Descrição"] = tabela["descricao"].fillna("")
+        tabela["Observação"] = tabela["observacao"].fillna("")
+
+        exibir = tabela[[
+            "id", "Vencimento", "categoria", "Descrição", "Valor", "Situação", "Observação"
+        ]].rename(columns={
+            "id": "ID",
+            "categoria": "Categoria",
+        })
+
+        st.dataframe(
+            exibir,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "ID": st.column_config.NumberColumn(format="%d"),
+                "Valor": st.column_config.NumberColumn(format="R$ %.2f"),
+            }
+        )
+
+        st.markdown("### Ações do lançamento")
+
+        opcoes = {}
+        for _, row in df_filtrado.iterrows():
+            sit = situacao_despesa(row["status"], row["data"], hoje)[1]
+            label = (
+                f"#{int(row['id'])} • {pd.Timestamp(row['data']).strftime('%d/%m/%Y')} • "
+                f"{row['categoria']} • {row['descricao'] or '-'} • {moeda(row['valor'])} • {sit}"
+            )
+            opcoes[label] = int(row["id"])
+
+        selecionado_label = st.selectbox(
+            "Selecione um lançamento",
+            list(opcoes.keys()),
+            key="cap_selecionado"
+        )
+        id_sel = opcoes[selecionado_label]
+        linha_sel = df_filtrado[df_filtrado["id"] == id_sel].iloc[0]
+        status_sel = str(linha_sel["status"])
+
+        a1, a2, a3 = st.columns([1, 1, 1])
+
+        if status_sel != "Pago":
+            if a1.button("✅ Marcar como pago", use_container_width=True, key="cap_btn_pagar"):
+                atualizar_status_despesa(id_sel, "Pago")
+                st.toast("Despesa marcada como paga.")
+                st.rerun()
+        else:
+            if a1.button("↩ Reabrir conta", use_container_width=True, key="cap_btn_reabrir"):
+                atualizar_status_despesa(id_sel, "Em aberto")
+                st.toast("Despesa reaberta.")
                 st.rerun()
 
+        confirmar_exclusao = a2.checkbox("Confirmar exclusão", key="cap_confirm_del")
+        if a3.button(
+            "🗑 Excluir",
+            use_container_width=True,
+            disabled=not confirmar_exclusao,
+            key="cap_btn_excluir"
+        ):
+            excluir_despesa(id_sel)
+            st.success("Despesa excluída com sucesso.")
+            st.rerun()
 
+
+# =========================================================
+# DRE GERENCIAL
+# =========================================================
 elif menu == "DRE Gerencial":
 
     st.subheader("DRE Gerencial")
@@ -2982,7 +4665,7 @@ elif menu == "DRE Gerencial":
             data_desp = st.date_input("Data da despesa", value=hoje)
             categoria = st.selectbox(
                 "Categoria",
-                ["Aluguel", "Funcionários", "Energia", "Água", "Internet", "Contador", "Taxas/Cartões", "iFood/Delivery", "Marketing", "Manutenção", "Embalagens", "Outros"]
+                CATEGORIAS_DESPESA
             )
             descricao = st.text_input("Descrição")
             valor = st.number_input("Valor da despesa", min_value=0.01, step=10.0)
@@ -3353,36 +5036,81 @@ elif menu == "Usuários":
 # PRODUTOS
 # =========================================================
 elif menu == "Produtos":
-    st.subheader("Cadastrar Produto")
+    st.subheader("Cadastro Profissional de Produtos")
+    st.caption("Catálogo com SKU, código de barras, custo de referência, preço e estoque integrado ao PEPS.")
 
     with st.form("prod"):
-        nome = st.text_input("Nome")
-        cat = st.text_input("Categoria")
-        un = st.selectbox("Unidade", ["UN", "KG", "G", "L", "ML", "CX"])
-        minimo = st.number_input("Estoque mínimo", min_value=0.0, step=1.0)
-        preco = st.number_input("Preço de venda padrão", min_value=0.0, step=0.5)
-        ok = st.form_submit_button("Salvar")
+        c1, c2 = st.columns(2)
+        codigo = c1.text_input("Código interno (SKU)", placeholder="Ex: CRO-001 ou deixe vazio para gerar")
+        codigo_barras = c2.text_input("Código de barras (EAN)", placeholder="Opcional — leitor futuro")
+
+        c3, c4 = st.columns(2)
+        nome = c3.text_input("Nome")
+        cat = c4.text_input("Categoria")
+
+        c5, c6, c7 = st.columns(3)
+        un = c5.selectbox("Unidade", ["UN", "KG", "G", "L", "ML", "CX"])
+        minimo = c6.number_input("Estoque mínimo", min_value=0.0, step=1.0)
+        custo_ref = c7.number_input("Custo referência (R$)", min_value=0.0, step=0.5, help="Usado quando ainda não há entrada PEPS.")
+
+        preco = st.number_input("Preço de venda (R$)", min_value=0.0, step=0.5)
+
+        with st.expander("Dados fiscais (NFC-e futura)"):
+            f1, f2 = st.columns(2)
+            ncm = f1.text_input("NCM", placeholder="Ex: 19059090")
+            cst = f2.text_input("CST", placeholder="Ex: 102")
+            f3, f4, f5 = st.columns(3)
+            icms = f3.number_input("ICMS (%)", min_value=0.0, step=0.5)
+            pis = f4.number_input("PIS (%)", min_value=0.0, step=0.5)
+            cofins = f5.number_input("COFINS (%)", min_value=0.0, step=0.5)
+
+        ok = st.form_submit_button("Salvar produto", use_container_width=True)
 
         if ok:
-            c = conn()
-            cur = c.cursor()
+            if not str(nome).strip():
+                st.error("Informe o nome do produto.")
+            else:
+                try:
+                    inserir_produto_catalogo(
+                        nome=nome,
+                        categoria=cat or "Mercadoria",
+                        unidade=un,
+                        estoque_minimo=minimo,
+                        preco_venda=preco,
+                        codigo=codigo,
+                        codigo_barras=codigo_barras,
+                        custo_referencia=custo_ref,
+                        ncm=ncm,
+                        cst=cst,
+                        icms=icms,
+                        pis=pis,
+                        cofins=cofins,
+                    )
+                    st.success("Produto cadastrado com sucesso.")
+                    st.rerun()
+                except Exception as e:
+                    st.warning(f"Não salvei: {e}")
 
-            try:
-                cur.execute("""
-                    INSERT INTO produtos 
-                    (nome, categoria, unidade, estoque_minimo, preco_venda)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (nome, cat, un, minimo, preco))
+    st.markdown("### Catálogo atual")
+    catalogo = produtos_catalogo_df()
 
-                c.commit()
-                st.success("Produto cadastrado.")
-
-            except Exception as e:
-                st.warning(f"Não salvei: {e}")
-
-            c.close()
-
-    st.dataframe(produtos_df().drop(columns=["ativo"]), use_container_width=True)
+    if catalogo.empty:
+        st.info("Nenhum produto cadastrado.")
+    else:
+        exibir_cat = catalogo[[
+            "Código", "Nome", "Categoria", "Unidade",
+            "Custo", "Preço", "Estoque", "Código de Barras"
+        ]]
+        st.dataframe(
+            exibir_cat,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Custo": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Preço": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Estoque": st.column_config.NumberColumn(format="%.2f"),
+            }
+        )
 
 
 
@@ -3707,6 +5435,577 @@ elif menu == "Entrada Manual":
 
 
 # =========================================================
+# PDV / FRENTE DE CAIXA
+# =========================================================
+elif menu == "⚡ Operacional":
+    pdv_inicializar_estado()
+    pdv_preparar_estado_widgets()
+    pdv_sincronizar_carrinho()
+    operador_nome = user.get("nome", user.get("usuario", "Operador"))
+    carrinho = st.session_state["pdv_carrinho"]
+    pagamentos = st.session_state["pdv_pagamentos"]
+    resumo = pdv_resumo_atual()
+    erros_preco_pdv = pdv_validar_precos_carrinho(carrinho)
+
+    sucesso_pdv = st.session_state.pop("_pdv_success", None)
+    if sucesso_pdv:
+        st.balloons()
+        st.success(sucesso_pdv)
+
+    erro_pdv = st.session_state.pop("_pdv_error", None)
+    if erro_pdv:
+        st.error(erro_pdv)
+
+    st.markdown("""
+        <style>
+            .stApp { background: #eceff3 !important; }
+            .block-container {
+                padding-top: 0.45rem !important;
+                padding-bottom: 0.45rem !important;
+                max-width: 100% !important;
+            }
+            header[data-testid="stHeader"] {
+                background: rgba(255,255,255,.92) !important;
+                border-bottom: 1px solid #dde3ea !important;
+            }
+            div[data-testid="stRadio"] > div {
+                background: #ffffff !important;
+                border: 1px solid #d7dee8 !important;
+                border-radius: 12px !important;
+                padding: 6px 10px !important;
+                box-shadow: 0 2px 8px rgba(15,23,42,.04) !important;
+            }
+            .pdv-top {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 14px;
+                padding: 10px 16px;
+                margin-bottom: 10px;
+                box-shadow: 0 4px 14px rgba(15,23,42,.05);
+            }
+            .pdv-top-title { font-size: 18px; font-weight: 900; color: #111827; line-height: 1.1; }
+            .pdv-top-sub { font-size: 12px; color: #64748b; font-weight: 700; margin-top: 2px; }
+            .pdv-search-wrap {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 16px;
+                padding: 12px 14px 8px 14px;
+                margin-bottom: 10px;
+                box-shadow: 0 6px 18px rgba(15,23,42,.06);
+            }
+            .pdv-search-wrap .stTextInput input {
+                min-height: 62px !important;
+                font-size: 22px !important;
+                font-weight: 800 !important;
+                border: 2px solid #cbd5e1 !important;
+                border-radius: 14px !important;
+                background: #f8fafc !important;
+                color: #0f172a !important;
+            }
+            .pdv-search-wrap .stTextInput input:focus {
+                border-color: #2563eb !important;
+                box-shadow: 0 0 0 3px rgba(37,99,235,.15) !important;
+            }
+            .pdv-card {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 16px;
+                padding: 14px;
+                box-shadow: 0 8px 22px rgba(15,23,42,.06);
+            }
+            .pdv-card-title {
+                font-size: 13px; font-weight: 900; color: #475569;
+                text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px;
+            }
+            .pdv-receipt {
+                background: #fcfcfd;
+                border: 1px dashed #cbd5e1;
+                border-radius: 12px;
+                padding: 8px 10px;
+                max-height: 420px;
+                overflow-y: auto;
+            }
+            .pdv-receipt table { width: 100%; border-collapse: collapse; font-size: 14px; }
+            .pdv-receipt th {
+                text-align: left; color: #64748b; font-size: 11px;
+                text-transform: uppercase; letter-spacing: .06em;
+                border-bottom: 1px solid #e2e8f0; padding: 6px 4px;
+            }
+            .pdv-receipt td {
+                padding: 8px 4px; border-bottom: 1px solid #f1f5f9;
+                color: #0f172a; font-weight: 700; vertical-align: top;
+            }
+            .pdv-receipt .pdv-line-sub { color: #059669; font-weight: 900; text-align: right; white-space: nowrap; }
+            .pdv-receipt .pdv-line-qty { color: #334155; white-space: nowrap; }
+            .pdv-pay-grid .stButton > button {
+                min-height: 58px; font-size: 15px; font-weight: 800;
+                border-radius: 12px; border: 1px solid #dbe3ec;
+                background: #f8fafc; color: #0f172a;
+            }
+            .pdv-pay-pix .stButton > button { background: #ecfdf5 !important; border-color: #86efac !important; color: #065f46 !important; }
+            .pdv-pay-card .stButton > button { background: #eff6ff !important; border-color: #93c5fd !important; color: #1e40af !important; }
+            .pdv-pay-cash .stButton > button { background: #fffbeb !important; border-color: #fcd34d !important; color: #92400e !important; }
+            .pdv-btn-main .stButton > button {
+                min-height: 56px; font-size: 17px; font-weight: 900;
+                border-radius: 14px; border: none;
+                background: linear-gradient(135deg, #16a34a, #22c55e) !important;
+                color: white !important;
+            }
+            .pdv-btn-ghost .stButton > button {
+                min-height: 44px; font-weight: 800; border-radius: 12px;
+                background: #ffffff !important; color: #334155 !important;
+                border: 1px solid #d7dee8 !important;
+            }
+            .pdv-btn-danger .stButton > button {
+                min-height: 44px; font-weight: 800; border-radius: 12px;
+                background: #fff1f2 !important; color: #be123c !important;
+                border: 1px solid #fecdd3 !important;
+            }
+            .pdv-chip {
+                display: inline-block; background: #f1f5f9; border: 1px solid #e2e8f0;
+                border-radius: 999px; padding: 6px 10px; margin: 0 6px 6px 0;
+                font-size: 12px; font-weight: 800; color: #334155;
+            }
+            .pdv-prod-card {
+                background: #ffffff;
+                border: 1px solid #dbe3ec;
+                border-radius: 14px;
+                padding: 12px 14px;
+                margin-bottom: 8px;
+                box-shadow: 0 4px 14px rgba(15,23,42,.04);
+            }
+            .pdv-prod-code {
+                display: inline-block;
+                background: #eff6ff;
+                color: #1d4ed8;
+                border: 1px solid #bfdbfe;
+                border-radius: 8px;
+                padding: 2px 8px;
+                font-size: 12px;
+                font-weight: 900;
+                margin-right: 8px;
+            }
+            .pdv-prod-name { font-size: 16px; font-weight: 900; color: #0f172a; line-height: 1.2; }
+            .pdv-prod-meta { font-size: 13px; color: #64748b; font-weight: 700; margin-top: 4px; }
+            .pdv-prod-price { font-size: 15px; font-weight: 900; color: #059669; }
+            .pdv-prod-stock { font-size: 13px; font-weight: 800; color: #475569; }
+            .pdv-results-title {
+                font-size: 13px; font-weight: 900; color: #475569;
+                text-transform: uppercase; letter-spacing: .08em;
+                margin: 4px 0 8px 0;
+            }
+            .pdv-footer-bar {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 14px;
+                padding: 12px 16px;
+                margin-top: 10px;
+                box-shadow: 0 8px 22px rgba(15,23,42,.06);
+            }
+            .pdv-footer-grid {
+                display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+            }
+            .pdv-foot-label { font-size: 11px; color: #64748b; font-weight: 800; text-transform: uppercase; }
+            .pdv-foot-value { font-size: 22px; color: #0f172a; font-weight: 900; margin-top: 2px; }
+            .pdv-foot-value.total { color: #059669; font-size: 28px; }
+            .pdv-foot-value.troco { color: #d97706; }
+            .pdv-empty {
+                text-align: center; color: #64748b; font-weight: 700;
+                padding: 28px 12px; font-size: 14px;
+            }
+            .pdv-caixa-badge {
+                display: inline-flex; align-items: center; gap: 8px;
+                background: #ecfdf5; border: 1px solid #86efac; color: #065f46;
+                border-radius: 999px; padding: 8px 14px; font-size: 13px; font-weight: 800;
+            }
+            .pdv-caixa-badge.fechado {
+                background: #fff7ed; border-color: #fdba74; color: #9a3412;
+            }
+            .pdv-caixa-panel {
+                background: #ffffff; border: 1px solid #d7dee8; border-radius: 16px;
+                padding: 16px; box-shadow: 0 8px 22px rgba(15,23,42,.06); margin-bottom: 12px;
+            }
+            .pdv-caixa-kpi {
+                background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px;
+                padding: 12px 14px;
+            }
+            .pdv-caixa-kpi-label { font-size: 11px; color: #64748b; font-weight: 800; text-transform: uppercase; }
+            .pdv-caixa-kpi-value { font-size: 20px; color: #0f172a; font-weight: 900; margin-top: 4px; }
+            @media (max-width: 980px) {
+                .pdv-footer-grid { grid-template-columns: repeat(2, 1fr); }
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    caixa_ativo = caixa_aberto()
+    resumo_caixa_ativo = resumo_caixa(caixa_ativo["id"]) if caixa_ativo else None
+
+    pdv_aba = st.segmented_control(
+        "Área do PDV",
+        options=["🛒 Venda", "💰 Caixa"],
+        default="🛒 Venda",
+        key="pdv_aba",
+    )
+
+    if pdv_aba == "💰 Caixa":
+        if caixa_ativo:
+            rc = resumo_caixa_ativo
+            st.markdown(
+                f'<span class="pdv-caixa-badge">● Caixa #{caixa_ativo["id"]} ABERTO • '
+                f'{caixa_ativo["data_abertura"]} {caixa_ativo["hora_abertura"]} • '
+                f'{caixa_ativo["operador_abertura"]}</span>',
+                unsafe_allow_html=True,
+            )
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Vendas", rc["qtd_vendas"])
+            k2.metric("Total vendido", moeda(rc["total_vendido"]))
+            k3.metric("Ticket médio", moeda(rc["ticket_medio"]))
+            k4.metric("Descontos", moeda(rc["total_descontos"]))
+
+            st.markdown("#### Totais por forma de pagamento")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Dinheiro", moeda(rc["total_dinheiro"]))
+            p2.metric("PIX", moeda(rc["total_pix"]))
+            p3.metric("Crédito", moeda(rc["total_credito"]))
+            p4.metric("Débito", moeda(rc["total_debito"]))
+
+            st.markdown("#### Conferência de gaveta")
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Valor inicial", moeda(rc["valor_inicial"]))
+            g2.metric("Esperado em dinheiro", moeda(rc["valor_esperado_dinheiro"]))
+            g3.metric("Troco concedido", moeda(rc["total_troco"]))
+
+            if rc["qtd_cancelamentos"]:
+                st.warning(f"Cancelamentos no turno: {rc['qtd_cancelamentos']}")
+            if rc["nfce_pendencias"]:
+                st.caption(f"NFC-e pendente em {rc['nfce_pendencias']} venda(s) — preparado para emissão futura.")
+
+            with st.form("form_fechar_caixa", clear_on_submit=False):
+                st.markdown("**Fechar caixa**")
+                valor_contado = st.number_input(
+                    "Valor contado em dinheiro (gaveta)",
+                    min_value=0.0,
+                    step=1.0,
+                    value=float(rc["valor_esperado_dinheiro"]),
+                )
+                obs_fech = st.text_input("Observação de fechamento", placeholder="Opcional")
+                fechar_ok = st.form_submit_button("Fechar caixa", type="primary", use_container_width=True)
+                if fechar_ok:
+                    try:
+                        resumo_fech = fechar_caixa(
+                            caixa_ativo["id"],
+                            operador_nome,
+                            valor_contado,
+                            obs_fech,
+                        )
+                        diff = float(resumo_fech.get("diferenca_dinheiro") or 0)
+                        if abs(diff) <= 0.009:
+                            st.success(
+                                f"Caixa #{caixa_ativo['id']} fechado • Conferência OK • "
+                                f"Total vendido {moeda(resumo_fech['total_vendido'])}"
+                            )
+                        elif diff > 0:
+                            st.success(
+                                f"Caixa fechado • Sobra de {moeda(diff)} em dinheiro • "
+                                f"Total vendido {moeda(resumo_fech['total_vendido'])}"
+                            )
+                        else:
+                            st.warning(
+                                f"Caixa fechado • Falta de {moeda(abs(diff))} em dinheiro • "
+                                f"Total vendido {moeda(resumo_fech['total_vendido'])}"
+                            )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+        else:
+            st.markdown(
+                '<span class="pdv-caixa-badge fechado">● Nenhum caixa aberto</span>',
+                unsafe_allow_html=True,
+            )
+            st.markdown("#### Abrir caixa")
+            st.caption("Informe o fundo de troco em dinheiro para iniciar o turno.")
+
+            with st.form("form_abrir_caixa", clear_on_submit=False):
+                valor_inicial = st.number_input(
+                    "Valor inicial em dinheiro",
+                    min_value=0.0,
+                    step=10.0,
+                    value=0.0,
+                )
+                obs_abertura = st.text_input("Observação", placeholder="Opcional")
+                abrir_ok = st.form_submit_button("Abrir caixa", type="primary", use_container_width=True)
+                if abrir_ok:
+                    try:
+                        novo_id = abrir_caixa(operador_nome, valor_inicial, obs_abertura)
+                        st.success(f"Caixa #{novo_id} aberto com {moeda(valor_inicial)} em dinheiro.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    elif not caixa_ativo:
+        if pdv_aba == "🛒 Venda":
+            st.info("Abra o caixa em **💰 Caixa** para liberar vendas.")
+            st.caption("Use o seletor acima para ir à abertura de caixa.")
+
+    elif pdv_aba == "🛒 Venda" and resumo_caixa_ativo:
+        st.caption(
+            f"Caixa #{caixa_ativo['id']} • Vendas: {resumo_caixa_ativo['qtd_vendas']} • "
+            f"Turno: {moeda(resumo_caixa_ativo['total_vendido'])} • Enter adiciona produto"
+        )
+
+    if pdv_aba == "🛒 Venda" and caixa_ativo:
+        t1, t2, t3, t4 = st.columns([3.2, 1.2, 1, 1])
+        with t1:
+            st.markdown(f"""
+                <div class="pdv-top">
+                    <div class="pdv-top-title">Caixa • PDV Restaurante</div>
+                    <div class="pdv-top-sub">Operador: {operador_nome} • PEPS + CMV automático</div>
+                </div>
+            """, unsafe_allow_html=True)
+        with t2:
+            st.button(
+                "Cancelar venda",
+                use_container_width=True,
+                key="pdv_cancelar",
+                on_click=pdv_on_cancelar_venda,
+            )
+        with t3:
+            st.button(
+                "Limpar busca",
+                use_container_width=True,
+                key="pdv_limpar_busca",
+                on_click=pdv_on_limpar_busca,
+            )
+        with t4:
+            if st.button("Sair", use_container_width=True, key="pdv_sair"):
+                fazer_logout()
+
+        with st.container(border=True):
+            st.markdown("**Buscar produto** — nome, SKU ou código de barras • **Enter** confirma")
+            st.text_input(
+                "Buscar produto",
+                placeholder="Digite ou escaneie...",
+                key="pdv_busca",
+                label_visibility="collapsed",
+                on_change=pdv_on_busca_change,
+            )
+            b1, b2, b3 = st.columns([1, 1.2, 2.8])
+            b1.number_input("Qtd", min_value=0.01, step=1.0, key="pdv_qtd_rapida")
+            with b2:
+                st.button(
+                    "Adicionar",
+                    use_container_width=True,
+                    key="pdv_add_btn",
+                    type="primary",
+                    on_click=pdv_on_adicionar_click,
+                )
+
+        toast_msg = st.session_state.pop("_pdv_toast", None)
+        if toast_msg:
+            st.toast(toast_msg)
+
+        aviso_add = st.session_state.pop("_pdv_add_warning", None)
+        if aviso_add:
+            st.warning(aviso_add)
+
+        termo_busca = str(st.session_state.get("pdv_busca", "") or "").strip()
+        resultados_pdv = buscar_produtos_catalogo(termo_busca, limite=12) if termo_busca else pd.DataFrame()
+
+        if termo_busca:
+            if resultados_pdv.empty:
+                st.info("Nenhum produto encontrado.")
+            else:
+                st.markdown(
+                    f'<div class="pdv-results-title">{len(resultados_pdv)} produto(s) encontrado(s)</div>',
+                    unsafe_allow_html=True,
+                )
+                for idx, (_, prod) in enumerate(resultados_pdv.iterrows()):
+                    codigo = prod.get("Código") or "-"
+                    nome = prod.get("Nome") or ""
+                    categoria = prod.get("Categoria") or "-"
+                    preco = moeda(prod.get("Preço", 0))
+                    estoque = float(prod.get("Estoque", 0) or 0)
+                    unidade = prod.get("Unidade") or "UN"
+
+                    with st.container(border=True):
+                        c_info, c_meta, c_btn = st.columns([3.4, 2.2, 1], gap="small", vertical_alignment="center")
+                        with c_info:
+                            st.markdown(f"**[{codigo}]** {nome}")
+                            st.caption(categoria)
+                        with c_meta:
+                            st.markdown(f"**Preço:** {preco}")
+                            st.markdown(f"**Estoque:** {estoque:.2f} {unidade}")
+                        with c_btn:
+                            st.button(
+                                "Adicionar",
+                                key=f"pdv_pick_{prod['id']}_{idx}",
+                                use_container_width=True,
+                                type="primary",
+                                on_click=pdv_on_pick_produto,
+                                args=(int(prod["id"]),),
+                            )
+
+        col_cupom, col_pag = st.columns([1.45, 1], gap="medium")
+
+        with col_cupom:
+            st.markdown("### Pedido atual")
+
+            if not carrinho:
+                st.info("Nenhum item no pedido")
+            else:
+                if erros_preco_pdv:
+                    st.error(
+                        "Há produto(s) com preço não cadastrado. "
+                        "Cadastre o preço em Produtos antes de finalizar a venda."
+                    )
+
+                for item in carrinho:
+                    subtotal_item = pdv_item_subtotal(item)
+                    sem_preco = float(item.get("preco_unitario", 0) or 0) <= 0.001
+
+                    with st.container(border=True):
+                        c_qtd, c_info, c_sub, c_del = st.columns(
+                            [0.8, 3.6, 1.2, 0.5],
+                            gap="small",
+                            vertical_alignment="center",
+                        )
+                        with c_qtd:
+                            st.markdown(f"**{item['quantidade']:.2f}**")
+                            st.caption(item.get("unidade") or "UN")
+                        with c_info:
+                            codigo = item.get("codigo") or "-"
+                            st.markdown(f"**[{codigo}]** {item.get('nome') or 'Produto'}")
+                            if sem_preco:
+                                st.warning("Preço não cadastrado")
+                            else:
+                                st.caption(f"Unitário: {moeda(item['preco_unitario'])}")
+                        with c_sub:
+                            st.markdown("**Subtotal**")
+                            st.markdown(f"**{moeda(subtotal_item)}**")
+                        with c_del:
+                            st.button(
+                                "✕",
+                                key=f"pdv_del_{item['uid']}",
+                                use_container_width=True,
+                                on_click=pdv_on_remover_item,
+                                args=(item["uid"],),
+                            )
+
+        with col_pag:
+            st.markdown("### Pagamento")
+
+            st.number_input(
+                "Desconto (R$)",
+                min_value=0.0,
+                step=1.0,
+                key="pdv_desconto",
+                on_change=pdv_on_desconto_change,
+            )
+            resumo = pdv_resumo_atual()
+
+            st.caption(f"Restante: **{moeda(resumo['falta'])}** • Pago: **{moeda(resumo['pago'])}**")
+
+            st.markdown("**Forma de pagamento**")
+            forma_sel = st.radio(
+                "Forma",
+                PDV_FORMAS_PAGAMENTO,
+                horizontal=True,
+                key="pdv_forma_sel",
+                label_visibility="collapsed",
+            )
+
+            st.number_input("Valor do pagamento", min_value=0.0, step=1.0, key="pdv_valor_pg")
+
+            valor_restante = resumo["falta"] if resumo["falta"] > 0.009 else resumo["total"]
+            p1, p2 = st.columns(2)
+            with p1:
+                st.button(
+                    "PIX",
+                    use_container_width=True,
+                    key="pdv_quick_pix",
+                    on_click=pdv_on_quick_pagamento,
+                    args=("PIX", valor_restante),
+                )
+                st.button(
+                    "Débito",
+                    use_container_width=True,
+                    key="pdv_quick_deb",
+                    on_click=pdv_on_quick_pagamento,
+                    args=("Débito", valor_restante),
+                )
+            with p2:
+                st.button(
+                    "Crédito",
+                    use_container_width=True,
+                    key="pdv_quick_cred",
+                    on_click=pdv_on_quick_pagamento,
+                    args=("Crédito", valor_restante),
+                )
+                st.button(
+                    "Dinheiro",
+                    use_container_width=True,
+                    key="pdv_quick_cash",
+                    on_click=pdv_on_quick_pagamento,
+                    args=("Dinheiro", valor_restante),
+                )
+
+            st.button(
+                "Adicionar pagamento",
+                use_container_width=True,
+                key="pdv_add_pg",
+                on_click=pdv_on_adicionar_pagamento,
+            )
+
+            if pagamentos:
+                for pg in pagamentos:
+                    c_pg, c_pg_del = st.columns([5, 1])
+                    with c_pg:
+                        st.markdown(
+                            f"<span class='pdv-chip'>{pg['forma']} • {moeda(pg['valor'])}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    with c_pg_del:
+                        st.button(
+                            "✕",
+                            key=f"pdv_pg_del_{pg['uid']}",
+                            on_click=pdv_on_remover_pagamento,
+                            args=(pg["uid"],),
+                        )
+
+            if resumo["troco"] > 0.009:
+                st.success(f"Troco: {moeda(resumo['troco'])}")
+
+            if erros_preco_pdv:
+                st.button(
+                    "Finalizar venda",
+                    use_container_width=True,
+                    key="pdv_finalizar",
+                    disabled=True,
+                    help="Cadastre o preço de todos os produtos antes de finalizar.",
+                )
+            else:
+                st.button(
+                    "Finalizar venda",
+                    use_container_width=True,
+                    key="pdv_finalizar",
+                    type="primary",
+                    on_click=pdv_on_finalizar_venda,
+                    args=(operador_nome,),
+                )
+
+        resumo = pdv_resumo_atual()
+        foot1, foot2, foot3, foot4 = st.columns(4)
+        with foot1:
+            st.metric("Subtotal", moeda(resumo["subtotal"]))
+        with foot2:
+            st.metric("Desconto", moeda(resumo["desconto"]))
+        with foot3:
+            st.metric("Total", moeda(resumo["total"]))
+        with foot4:
+            st.metric("Troco", moeda(resumo["troco"]))
+
+
+    # =========================================================
 # SAÍDA / VENDA / PERDA
 # =========================================================
 elif menu == "Lançar Saída":
@@ -3761,6 +6060,91 @@ elif menu == "Lotes":
 
 elif menu == "Movimentações":
     st.dataframe(mov_df(), use_container_width=True)
+
+
+# =========================================================
+# RELATÓRIO VENDAS PDV
+# =========================================================
+elif menu == "Relatório Vendas PDV":
+    st.subheader("Relatório de Vendas PDV")
+    st.caption("Análise rápida por período, operador e forma de pagamento.")
+
+    hoje = date.today()
+    c1, c2, c3, c4 = st.columns(4)
+    data_ini = c1.date_input("Data inicial", hoje.replace(day=1), key="rel_pdv_ini")
+    data_fim = c2.date_input("Data final", hoje, key="rel_pdv_fim")
+
+    c = conn()
+    operadores_df = pd.read_sql_query("""
+        SELECT DISTINCT operador
+        FROM pdv_vendas
+        WHERE operador IS NOT NULL AND TRIM(operador) != ''
+        ORDER BY operador
+    """, c)
+    c.close()
+    opcoes_operador = ["Todos"] + operadores_df["operador"].tolist()
+    operador_filtro = c3.selectbox("Operador", opcoes_operador, key="rel_pdv_operador")
+    forma_filtro = c4.selectbox(
+        "Forma de pagamento",
+        ["Todas"] + PDV_FORMAS_PAGAMENTO,
+        key="rel_pdv_forma",
+    )
+
+    rel = relatorio_vendas_pdv(
+        data_ini,
+        data_fim,
+        operador="" if operador_filtro == "Todos" else operador_filtro,
+        forma="" if forma_filtro == "Todas" else forma_filtro,
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Vendas", rel["qtd_vendas"])
+    m2.metric("Total geral", moeda(rel["total_geral"]))
+    m3.metric("Ticket médio", moeda(rel["ticket_medio"]))
+    m4.metric("Descontos", moeda(rel["total_descontos"]))
+    m5.metric("Período", f"{data_ini.strftime('%d/%m')} → {data_fim.strftime('%d/%m')}")
+
+    st.markdown("#### Totais por forma de pagamento")
+    f1, f2, f3, f4 = st.columns(4)
+    totais = rel.get("totais_forma", {})
+    f1.metric("Dinheiro", moeda(totais.get("Dinheiro", 0)))
+    f2.metric("PIX", moeda(totais.get("PIX", 0)))
+    f3.metric("Crédito", moeda(totais.get("Crédito", 0)))
+    f4.metric("Débito", moeda(totais.get("Débito", 0)))
+
+    vendas_df = rel["vendas"]
+    if vendas_df.empty:
+        st.info("Nenhuma venda encontrada para os filtros selecionados.")
+    else:
+        exibir = vendas_df.copy()
+        exibir["subtotal"] = exibir["subtotal"].apply(moeda)
+        exibir["desconto"] = exibir["desconto"].apply(moeda)
+        exibir["total"] = exibir["total"].apply(moeda)
+        exibir["troco"] = exibir["troco"].apply(moeda)
+        st.dataframe(
+            exibir.rename(columns={
+                "venda_id": "Venda",
+                "data": "Data",
+                "hora": "Hora",
+                "operador": "Operador",
+                "caixa_id": "Caixa",
+                "subtotal": "Subtotal",
+                "desconto": "Desconto",
+                "total": "Total",
+                "troco": "Troco",
+                "status": "Status",
+                "nfce_status": "NFC-e",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if not rel["pagamentos"].empty:
+            with st.expander("Detalhe de pagamentos"):
+                pag = rel["pagamentos"].copy()
+                pag["valor"] = pag["valor"].apply(moeda)
+                pag["troco"] = pag["troco"].apply(moeda)
+                st.dataframe(pag, use_container_width=True, hide_index=True)
 
 
 # =========================================================

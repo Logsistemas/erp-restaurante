@@ -3,5 +3,19 @@
     "usuario": "admin",
     "senha": "1234",
     "tipo": "admin"
+  },
+  {
+    "usuario": "Zeca",
+    "senha": "1234",
+    "tipo": "operador",
+    "nome": "Zeca",
+    "ativo": true
+  },
+  {
+    "usuario": "zeca2",
+    "senha": "1234",
+    "tipo": "financeiro",
+    "nome": "Ze",
+    "ativo": true
   }
 ]
